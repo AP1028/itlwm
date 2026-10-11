@@ -8322,10 +8322,10 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
     general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] =
         timeout;
     
-    general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] =
-        maxOut;
-    general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] =
-        timeout;
+    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
+        general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] = maxOut;
+        general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] = timeout;
+    }
 
     general_params->active_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
     general_params->passive_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
@@ -8448,10 +8448,10 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] =
         timeout;
     
-    general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] =
-        maxOut;
-    general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] =
-        timeout;
+    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
+        general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] = maxOut;
+        general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] = timeout;
+    }
 
     general_params->active_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
     general_params->passive_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
