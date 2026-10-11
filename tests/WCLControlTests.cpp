@@ -75,9 +75,28 @@ static void traffic()
     assert(idle.infraTx == after.infraTx && idle.infraRx == after.infraRx);
 }
 
+static void scanTiming()
+{
+    auto disconnected = AirportWCL::scanTiming(110, false, true);
+    assert(disconnected.maxOutTU == 0 && !disconnected.fragmented);
+    auto defaults = AirportWCL::scanTiming(0, true, true);
+    assert(defaults.maxOutTU == 120 && !defaults.fragmented);
+    auto native = AirportWCL::scanTiming(110, true, true);
+    assert(native.maxOutTU == 107 && native.fragmented);
+    auto oldFirmware = AirportWCL::scanTiming(110, true, false);
+    assert(oldFirmware.maxOutTU == 110 && !oldFirmware.fragmented);
+    auto minimum = AirportWCL::scanTiming(1, true, true);
+    assert(minimum.maxOutTU == 44 && minimum.fragmented);
+    auto maximum = AirportWCL::scanTiming(UINT32_MAX, true, true);
+    assert(maximum.maxOutTU == 120 && !maximum.fragmented);
+    const uint8_t request[8] = {110, 0, 0, 0, 45, 0, 0, 0};
+    assert(AirportWCL::read32(request) == 110);
+}
+
 int main()
 {
     channels();
     traffic();
+    scanTiming();
     puts("WCL control regression tests passed");
 }

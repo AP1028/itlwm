@@ -287,6 +287,25 @@ inline TrafficCounters makeTrafficCounters(const uint64_t *tx, const uint64_t *r
     return out;
 }
 
+struct ScanTiming {
+    uint32_t maxOutTU;
+    bool fragmented;
+};
+
+inline ScanTiming scanTiming(uint32_t awayMilliseconds, bool associated,
+                             bool supportsFragmentation)
+{
+    if (!associated)
+        return {0, false};
+    if (!awayMilliseconds)
+        return {120, false};
+    uint64_t requested = uint64_t(awayMilliseconds) * 1000 / 1024;
+    uint32_t minimum = supportsFragmentation ? 44 : 110;
+    uint32_t maxOut = requested < minimum ? minimum :
+        requested > 120 ? 120 : uint32_t(requested);
+    return {maxOut, maxOut < 110};
+}
+
 inline uint16_t read16(const uint8_t *p) {
     return uint16_t(p[0]) | uint16_t(p[1]) << 8;
 }

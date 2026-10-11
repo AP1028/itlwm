@@ -8057,6 +8057,13 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
     size_t req_len;
     int err, async = bgscan;
     const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
+#ifdef AIRPORT_WCL
+    const auto timing = AirportWCL::scanTiming(ic->ic_wcl_scan_away_time_ms, bgscan,
+        isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
+    const uint32_t maxOut = htole32(timing.maxOutTU);
+#else
+    const uint32_t maxOut = timeout;
+#endif
     uint8_t scan_ver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC);
     
     if (scan_ver == 12)
@@ -8095,12 +8102,12 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
             htole16(IWX_SCAN_ADWELL_MAX_BUDGET_FULL_SCAN);
         
         req->v7.scan_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
-        req->v7.max_out_time[IWX_SCAN_LB_LMAC_IDX] = timeout;
+        req->v7.max_out_time[IWX_SCAN_LB_LMAC_IDX] = maxOut;
         req->v7.suspend_time[IWX_SCAN_LB_LMAC_IDX] = timeout;
         
         if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
             req->v7.max_out_time[IWX_SCAN_HB_LMAC_IDX] =
-                timeout;
+                maxOut;
             req->v7.suspend_time[IWX_SCAN_HB_LMAC_IDX] =
                 timeout;
         }
@@ -8129,7 +8136,7 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
         
         if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
             req->v6.max_out_time[IWX_SCAN_HB_LMAC_IDX] =
-                timeout;
+                maxOut;
             req->v6.suspend_time[IWX_SCAN_HB_LMAC_IDX] =
                 timeout;
         }
@@ -8137,7 +8144,7 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
         req->v6.scan_priority =
             htole32(IWX_SCAN_PRIORITY_EXT_6);
         req->v6.max_out_time[IWX_SCAN_LB_LMAC_IDX] =
-            timeout;
+            maxOut;
         req->v6.suspend_time[IWX_SCAN_LB_LMAC_IDX] =
             timeout;
     }
@@ -8195,6 +8202,21 @@ iwx_umac_scan(struct iwx_softc *sc, int bgscan)
         htole32(IWX_UMAC_SCAN_GEN_FLAGS_EXTENDED_DWELL);
     }
     
+#ifdef AIRPORT_WCL
+    if (timing.fragmented) {
+        req->general_flags &= ~htole16(IWX_UMAC_SCAN_GEN_FLAGS_EXTENDED_DWELL);
+        req->general_flags |= htole16(IWX_UMAC_SCAN_GEN_FLAGS_FRAGMENTED);
+        bool cdb = isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT);
+        if (cdb)
+            req->general_flags |= htole16(IWX_UMAC_SCAN_GEN_FLAGS_LMAC2_FRAGMENTED);
+        if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_ADAPTIVE_DWELL_V2)) {
+            req->v8.num_of_fragments[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+            if (cdb)
+                req->v8.num_of_fragments[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+        }
+    }
+#endif
+
     if (isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_SCAN_EXT_CHAN_VER))
         err = iwx_fill_probe_req(sc, &tail->preq);
     else
@@ -8234,6 +8256,13 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
     size_t req_len;
     uint16_t gen_flags = 0;
     const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
+#ifdef AIRPORT_WCL
+    const auto timing = AirportWCL::scanTiming(ic->ic_wcl_scan_away_time_ms, bgscan,
+        isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
+    const uint32_t maxOut = htole32(timing.maxOutTU);
+#else
+    const uint32_t maxOut = timeout;
+#endif
     struct iwx_scan_general_params_v10 *general_params;
     struct iwx_scan_channel_params_v4 *cp;
     struct iwx_host_cmd hcmd = {
@@ -8263,6 +8292,16 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
     gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_PASS_ALL |
     IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
     
+#ifdef AIRPORT_WCL
+    if (timing.fragmented) {
+        gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC1;
+        general_params->num_of_fragments[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+        if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
+            gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC2;
+            general_params->num_of_fragments[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+        }
+    }
+#endif
     req->scan_params.general_params.flags = gen_flags;
     
     general_params->adwell_default_social_chn =
@@ -8279,12 +8318,12 @@ iwx_umac_scan_v12(struct iwx_softc *sc, int bgscan)
     
     general_params->scan_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
     general_params->max_out_of_time[IWX_SCAN_LB_LMAC_IDX] =
-        timeout;
+        maxOut;
     general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] =
         timeout;
     
     general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] =
-        timeout;
+        maxOut;
     general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] =
         timeout;
 
@@ -8346,6 +8385,13 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     struct iwx_scan_general_params_v10 *general_params;
     struct iwx_scan_channel_params_v6 *cp;
     const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
+#ifdef AIRPORT_WCL
+    const auto timing = AirportWCL::scanTiming(ic->ic_wcl_scan_away_time_ms, bgscan,
+        isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
+    const uint32_t maxOut = htole32(timing.maxOutTU);
+#else
+    const uint32_t maxOut = timeout;
+#endif
     struct iwx_host_cmd hcmd = {
         .id = iwx_cmd_id(IWX_SCAN_REQ_UMAC, IWX_LONG_GROUP, 0),
         .len = { 0, },
@@ -8373,6 +8419,16 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_PASS_ALL |
     IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
     
+#ifdef AIRPORT_WCL
+    if (timing.fragmented) {
+        gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC1;
+        general_params->num_of_fragments[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+        if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
+            gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC2;
+            general_params->num_of_fragments[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+        }
+    }
+#endif
     req->scan_params.general_params.flags = gen_flags;
     
     general_params->adwell_default_social_chn =
@@ -8388,12 +8444,12 @@ iwx_umac_scan_v14(struct iwx_softc *sc, int bgscan)
     
     general_params->scan_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
     general_params->max_out_of_time[IWX_SCAN_LB_LMAC_IDX] =
-        timeout;
+        maxOut;
     general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] =
         timeout;
     
     general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] =
-        timeout;
+        maxOut;
     general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] =
         timeout;
 

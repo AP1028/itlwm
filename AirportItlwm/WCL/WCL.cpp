@@ -130,6 +130,9 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
     switch (uintptr_t(a1)) {
         case 13: return self->copyWCLChannels(a2);
         case 14: return self->copyWCLTrafficCounters(a2);
+        case 15:
+            return self->fHalService->setScanHomeAwayTime(
+                AirportWCL::read32(static_cast<const uint8_t *>(a2)));
         case 12:
             self->handleWCLEvent(int(uintptr_t(a2)), nullptr);
             return kIOReturnSuccess;
@@ -927,6 +930,14 @@ IOReturn AirportItlwmSkywalkInterface::copyWCLTrafficCounters(void *data)
     return kIOReturnSuccess;
 }
 
+IOReturn AirportItlwmSkywalkInterface::setWCL_SET_SCAN_HOME_AWAY_TIME(scanHomeAndAwayTime *data)
+{
+    if (!data)
+        return kIOReturnBadArgument;
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
+    return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(15), data);
+}
 #endif
 
 #ifdef AIRPORT_WCL
