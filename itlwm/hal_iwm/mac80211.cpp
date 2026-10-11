@@ -3695,7 +3695,11 @@ iwm_start(struct _ifnet *ifp)
 //        if (that->outputThreadSignal) {
 //            semaphore_signal(that->outputThreadSignal);
 //        }
+#ifdef AIRPORT_WCL
+    that->getMainCommandGate()->runAction(_iwm_start_task, &that->com.sc_ic.ic_ac.ac_if);
+#else
     that->getMainCommandGate()->attemptAction(_iwm_start_task, &that->com.sc_ic.ic_ac.ac_if);
+#endif
 //    _iwm_start_task(that, &that->com.sc_ic.ic_ac.ac_if, NULL, NULL, NULL);
 }
 

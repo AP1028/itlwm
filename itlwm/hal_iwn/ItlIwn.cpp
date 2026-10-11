@@ -3873,7 +3873,11 @@ iwn_start(struct _ifnet *ifp)
 {
     struct iwn_softc *sc = (struct iwn_softc*)ifp->if_softc;
     ItlIwn *that = container_of(sc, ItlIwn, com);
+#ifdef AIRPORT_WCL
+    that->getMainCommandGate()->runAction(_iwn_start_task, &that->com.sc_ic.ic_ac.ac_if);
+#else
     that->getMainCommandGate()->attemptAction(_iwn_start_task, &that->com.sc_ic.ic_ac.ac_if);
+#endif
 }
 
 IOReturn ItlIwn::
