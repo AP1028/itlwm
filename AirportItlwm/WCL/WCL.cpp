@@ -127,6 +127,7 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
     if (self->wclStopping)
         return kIOReturnNotReady;
     switch (uintptr_t(a1)) {
+        case 13: return self->copyWCLChannels(a2);
         case 12:
             self->handleWCLEvent(int(uintptr_t(a2)), nullptr);
             return kIOReturnSuccess;
@@ -873,6 +874,37 @@ IOReturn AirportItlwmSkywalkInterface::getWCL_CHANNELS_INFO(apple80211ChannelInf
         memcpy(info->country, country.cc, 3);
     return info->count ? kIOReturnSuccess : kIOReturnNotReady;
 }
+
+IOReturn AirportItlwmSkywalkInterface::getCHANNELS_INFO(apple80211_channels_info *data)
+{
+    if (!data)
+        return kIOReturnBadArgument;
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
+    return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(13), data);
+}
+
+IOReturn AirportItlwmSkywalkInterface::copyWCLChannels(void *data)
+{
+    auto info = static_cast<AirportWCL::NativeChannelInfo *>(data);
+    bzero(info, sizeof(*info));
+    ieee80211com *ic = fHalService->get80211Controller();
+    for (unsigned i = 1; i <= IEEE80211_CHAN_MAX; ++i) {
+        const ieee80211_channel *channel = &ic->ic_channels[i];
+        if (!isset(ic->ic_chan_active, i) || !channel->ic_freq)
+            continue;
+        AirportWCL::appendChannel(*info, i, IEEE80211_IS_CHAN_5GHZ(channel),
+            channel->ic_flags & IEEE80211_CHAN_DFS,
+            channel->ic_flags & IEEE80211_CHAN_PASSIVE,
+            IEEE80211_IS_CHAN_HT40(channel) || IEEE80211_IS_CHAN_VHT40(channel),
+            IEEE80211_IS_CHAN_VHT80(channel));
+    }
+    apple80211_country_code_data country = {};
+    if (instance->getCOUNTRY_CODE(static_cast<OSObject *>(this), &country) == kIOReturnSuccess)
+        memcpy(info->country, country.cc, sizeof(country.cc));
+    return info->count ? kIOReturnSuccess : kIOReturnNotReady;
+}
+
 #endif
 
 #ifdef AIRPORT_WCL

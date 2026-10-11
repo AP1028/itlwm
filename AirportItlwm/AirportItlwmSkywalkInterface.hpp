@@ -162,7 +162,11 @@ public:
     virtual IOReturn getVHT_MCS_INDEX_SET(apple80211_vht_mcs_index_set_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getMCS_VHT(apple80211_mcs_vht_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getGAS_RESULTS(apple80211_gas_result_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+#ifdef AIRPORT_WCL
+    IOReturn getCHANNELS_INFO(apple80211_channels_info *) override;
+#else
     virtual IOReturn getCHANNELS_INFO(apple80211_channels_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+#endif
     virtual IOReturn getVHT_CAPABILITY(apple80211_vht_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getBGSCAN_CACHE_RESULTS(apple80211_bgscan_cached_network_data_list *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getROAM_PROFILE(apple80211_roam_profile_band_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -256,6 +260,7 @@ public:
 #ifdef AIRPORT_WCL
     virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) override;
     IOReturn copyWCLExtendedBss(void *);
+    IOReturn copyWCLChannels(void *);
 #else
     virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #endif
