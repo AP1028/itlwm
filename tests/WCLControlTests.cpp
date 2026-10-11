@@ -51,8 +51,33 @@ static void channels()
     assert(buffer.after == 0xfedcba9876543210ULL);
 }
 
+static void traffic()
+{
+    uint64_t tx[4] = {0x100000000ULL, 11, 19, 23};
+    uint64_t rx[4] = {29, 31, 37, 41};
+    auto before = AirportWCL::makeTrafficCounters(tx, rx, 1000000000ULL);
+    assert(read<uint64_t>(&before, 0) == 42);
+    assert(read<uint64_t>(&before, 8) == 78);
+    assert(read<uint64_t>(&before, 0x10) == 0x100000035ULL);
+    assert(read<uint64_t>(&before, 0x18) == 138);
+    assert(read<uint64_t>(&before, 0x20) == 0);
+    assert(read<uint64_t>(&before, 0x28) == 0);
+    assert(read<uint64_t>(&before, 0x30) == 1000000000ULL);
+    ++tx[0];
+    rx[3] += 3;
+    auto after = AirportWCL::makeTrafficCounters(tx, rx, 1500000000ULL);
+    assert(after.infraTx - before.infraTx == 1);
+    assert(after.infraRx - before.infraRx == 3);
+    assert(after.realtimeInfraTx - before.realtimeInfraTx == 0);
+    assert(after.realtimeInfraRx - before.realtimeInfraRx == 3);
+    assert(after.timestampNanoseconds - before.timestampNanoseconds == 500000000ULL);
+    auto idle = AirportWCL::makeTrafficCounters(tx, rx, 2000000000ULL);
+    assert(idle.infraTx == after.infraTx && idle.infraRx == after.infraRx);
+}
+
 int main()
 {
     channels();
+    traffic();
     puts("WCL control regression tests passed");
 }

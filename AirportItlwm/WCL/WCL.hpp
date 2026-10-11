@@ -261,6 +261,32 @@ inline bool appendChannel(NativeChannelInfo &info, unsigned channel, bool fiveGH
     return true;
 }
 
+struct TrafficCounters {
+    uint64_t realtimeInfraTx;
+    uint64_t realtimeInfraRx;
+    uint64_t infraTx;
+    uint64_t infraRx;
+    uint64_t realtimeAwdlTx;
+    uint64_t realtimeNanTx;
+    uint64_t timestampNanoseconds;
+};
+static_assert(sizeof(TrafficCounters) == 0x38, "WCL_TRAFFIC_COUNTERS native size");
+static_assert(offsetof(TrafficCounters, timestampNanoseconds) == 0x30, "WCL traffic timestamp");
+
+inline TrafficCounters makeTrafficCounters(const uint64_t *tx, const uint64_t *rx,
+                                           uint64_t timestampNanoseconds)
+{
+    TrafficCounters out = {};
+    out.realtimeInfraTx = tx[2] + tx[3];
+    out.realtimeInfraRx = rx[2] + rx[3];
+    for (unsigned ac = 0; ac < 4; ++ac) {
+        out.infraTx += tx[ac];
+        out.infraRx += rx[ac];
+    }
+    out.timestampNanoseconds = timestampNanoseconds;
+    return out;
+}
+
 inline uint16_t read16(const uint8_t *p) {
     return uint16_t(p[0]) | uint16_t(p[1]) << 8;
 }

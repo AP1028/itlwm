@@ -10,6 +10,7 @@
 #include "../AirportItlwmV2.hpp"
 #include "../AirportItlwmSkywalkInterface.hpp"
 #include <kern/thread_call.h>
+#include <kern/clock.h>
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_priv.h>
@@ -128,6 +129,7 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
         return kIOReturnNotReady;
     switch (uintptr_t(a1)) {
         case 13: return self->copyWCLChannels(a2);
+        case 14: return self->copyWCLTrafficCounters(a2);
         case 12:
             self->handleWCLEvent(int(uintptr_t(a2)), nullptr);
             return kIOReturnSuccess;
@@ -903,6 +905,26 @@ IOReturn AirportItlwmSkywalkInterface::copyWCLChannels(void *data)
     if (instance->getCOUNTRY_CODE(static_cast<OSObject *>(this), &country) == kIOReturnSuccess)
         memcpy(info->country, country.cc, sizeof(country.cc));
     return info->count ? kIOReturnSuccess : kIOReturnNotReady;
+}
+
+IOReturn AirportItlwmSkywalkInterface::getWCL_TRAFFIC_COUNTERS(apple80211_wcl_traffic_counters *data)
+{
+    if (!data)
+        return kIOReturnBadArgument;
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
+    return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(14), data);
+}
+
+IOReturn AirportItlwmSkywalkInterface::copyWCLTrafficCounters(void *data)
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    uint64_t timestamp;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &timestamp);
+    const auto counters = AirportWCL::makeTrafficCounters(
+        ic->ic_wcl_tx_packets, ic->ic_wcl_rx_packets, timestamp);
+    memcpy(data, &counters, sizeof(counters));
+    return kIOReturnSuccess;
 }
 
 #endif

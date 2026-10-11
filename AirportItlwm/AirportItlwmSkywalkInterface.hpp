@@ -240,7 +240,11 @@ public:
 #else
     virtual IOReturn getWCL_BSS_INFO(apple80211_beacon_msg *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #endif
+#ifdef AIRPORT_WCL
+    IOReturn getWCL_TRAFFIC_COUNTERS(apple80211_wcl_traffic_counters *) override;
+#else
     virtual IOReturn getWCL_TRAFFIC_COUNTERS(apple80211_wcl_traffic_counters *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+#endif
     virtual IOReturn getWCL_GET_TX_BLANKING_STATUS(uint *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getSSID_TRANSITION_SUPPORT(apple80211_ssid_transition_feature_enabled *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #ifdef AIRPORT_WCL
@@ -261,6 +265,7 @@ public:
     virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) override;
     IOReturn copyWCLExtendedBss(void *);
     IOReturn copyWCLChannels(void *);
+    IOReturn copyWCLTrafficCounters(void *);
 #else
     virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #endif

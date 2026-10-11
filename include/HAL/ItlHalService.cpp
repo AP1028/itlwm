@@ -20,6 +20,11 @@ OSDefineMetaClassAndAbstractStructors(ItlHalService, OSObject)
 bool ItlHalService::
 initWithController(IOEthernetController *controller, IOWorkLoop *workloop, IOCommandGate *commandGate)
 {
+#ifdef AIRPORT_WCL
+    auto ic = get80211Controller();
+    bzero(ic->ic_wcl_tx_packets, sizeof(ic->ic_wcl_tx_packets));
+    bzero(ic->ic_wcl_rx_packets, sizeof(ic->ic_wcl_rx_packets));
+#endif
     this->controller = controller;
     this->controller->retain();
     this->mainWorkLoop = workloop;
