@@ -16,6 +16,7 @@
 #define ItlHalService_hpp
 
 #include <libkern/c++/OSObject.h>
+#include <libkern/c++/OSString.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOCommandGate.h>
@@ -23,9 +24,6 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/network/IOEthernetController.h>
 #include <IOKit/network/IOEthernetInterface.h>
-#ifdef AIRPORT_VTD
-#include <ItlDma.hpp>
-#endif
 
 #include "ItlDriverInfo.hpp"
 #include "ItlDriverController.hpp"
@@ -54,6 +52,31 @@ public:
     
     virtual ItlDriverController *getDriverController() = 0;
     
+    /*
+     * Read-only control channel (round S20/S21).  Returns a one-line status blob,
+     * or NULL if this HAL has no control channel.
+     *
+     * Deliberately NOT pure virtual: hal_iwm and hal_iwn inherit this default and
+     * are untouched, so only hal_iwx needs to implement it.  There is deliberately
+     * no "up" command -- that would drive the path the tool calls rather than the
+     * path the driver takes at boot, and would need a new state machine.
+     *
+     * CONTRACT for implementors, learned from this session's failures:
+     *  - report the RETURN CODE of every device-memory read alongside its values
+     *    (a zero-filled buffer that cannot distinguish "read zeros" from "read
+     *    failed" is what made one earlier reading ambiguous);
+     *  - PURE READ.  No device register writes.  If any read takes the nic lock
+     *    and clears BZ_MAC_ACCESS_REQ (CSR_GP_CNTRL BIT(21)) -- as iwl_read_prph
+     *    does -- perform it LAST and say so in the blob, so nobody samples
+     *    GP_CNTRL after it and believes the cleared bit.
+     */
+    virtual OSString *getCtlStatus(void) { return NULL; }
+
+    /* S217: the write-capable diagnostic channel (drain control, deterministic recovery).
+     * Not pure: every HAL that does not implement it returns NULL and the caller publishes
+     * "this HAL has no S217 channel". */
+    virtual OSString *ctlS217(const char *cmd) { (void)cmd; return NULL; }
+    
     virtual void free() override;
 
 public:
@@ -70,13 +93,6 @@ protected:
     IOCommandGate *getMainCommandGate();
     
     IOWorkLoop *getMainWorkLoop();
-
-#ifdef AIRPORT_VTD
-    bool prepareDma(IOPCIDevice *device, uint8_t addressBits);
-    ItlDmaArena *dmaArena;
-    uint64_t dmaEpoch;
-    bool dmaDetaching;
-#endif
     
 private:
     IOEthernetController *controller;

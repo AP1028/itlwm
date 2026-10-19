@@ -102,6 +102,15 @@ IOService* itlwm::probe(IOService *provider, SInt32 *score)
         }
         return this;
     }
+    /*
+     * Note: this driver's Info.plist matches Intel vendor-wide
+     * (IOPCIPrimaryMatch = 0x00008086&0x0000ffff), so probe() is invoked for
+     * every Intel PCI device and most of them reach here. Logging the device id
+     * makes a genuine no-match on a supported part distinguishable from the
+     * normal stream of unsupported ones.
+     */
+    XYLog("%s: no HAL matched devId=0x%04x -> returning NULL\n", __FUNCTION__,
+          device->configRead16(kIOPCIConfigDeviceID));
     return NULL;
 }
 
@@ -333,7 +342,6 @@ bool itlwm::start(IOService *provider)
         return false;
     }
     fHalService->initWithController(this, _fWorkloop, _fCommandGate);
-    
     if (PE_parse_boot_argn("-novht", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOVHT;
     if (PE_parse_boot_argn("-noht40", &boot_value, sizeof(boot_value)))
@@ -455,6 +463,71 @@ bool itlwm::createWorkLoop()
 IOWorkLoop *itlwm::getWorkLoop() const
 {
     return _fWorkloop;
+}
+
+/*
+ * Read-only control channel: userspace sets the CFProperty "iwxctl" on this
+ * service (IORegistryEntrySetCFProperties) and we publish the answer as
+ * "iwxctl_status" for readback with `ioreg -l`.  There is no return channel from
+ * setProperties itself, which is why the result goes back through a property.
+ *
+ * "status" is the only command.  There is deliberately no "up": that would drive
+ * the path the tool calls rather than the path the driver takes at boot, and
+ * would need a new state machine.  This never writes a device register.
+ */
+IOReturn itlwm::setProperties(OSObject *properties)
+{
+    OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+    OSString *cmd;
+    OSString *result;
+    
+    if (dict == NULL)
+        return super::setProperties(properties);
+    
+    cmd = OSDynamicCast(OSString, dict->getObject("iwxctl"));
+    if (cmd == NULL)
+        return super::setProperties(properties);
+    
+    {
+        const char *cs = cmd->getCStringNoCopy();
+        /* S217: "s217 <cmd>" is forwarded to the HAL; the answer is published exactly like
+         * "status" so the existing iwxctl tool reads it back. */
+        if (cs != NULL && cs[0] == 's' && cs[1] == '2' && cs[2] == '1' &&
+            cs[3] == '7' && cs[4] == ' ') {
+            if (fHalService == NULL) {
+                setProperty("iwxctl_status", "no HAL service");
+                return kIOReturnSuccess;
+            }
+            result = fHalService->ctlS217(cs + 5);
+            if (result == NULL) {
+                setProperty("iwxctl_status", "this HAL has no S217 channel");
+                return kIOReturnSuccess;
+            }
+            setProperty("iwxctl_status", result);
+            result->release();
+            return kIOReturnSuccess;
+        }
+    }
+
+    if (cmd->isEqualTo("status")) {
+        if (fHalService == NULL) {
+            setProperty("iwxctl_status", "no HAL service");
+            return kIOReturnSuccess;
+        }
+        result = fHalService->getCtlStatus();
+        if (result == NULL) {
+            setProperty("iwxctl_status", "this HAL has no control channel");
+            return kIOReturnSuccess;
+        }
+        setProperty("iwxctl_status", result);
+        result->release();
+        return kIOReturnSuccess;
+    }
+    
+    XYLog("%s: unknown iwxctl command '%s'\n", __FUNCTION__,
+          cmd->getCStringNoCopy());
+    setProperty("iwxctl_status", "unknown command");
+    return kIOReturnSuccess;
 }
 
 IOReturn itlwm::selectMedium(const IONetworkMedium *medium) {
@@ -594,6 +667,9 @@ IOReturn itlwm::outputStart(IONetworkInterface *interface, IOOptionBits options)
 }
 #endif
 
+/* S202: defined in hal_iwx/ItlIwx.cpp; timestamps the interface-queue enqueue. */
+extern void iwxabS202NoteEnqueue(mbuf_t m);
+
 UInt32 itlwm::outputPacket(mbuf_t m, void *param)
 {
 //    XYLog("%s\n", __FUNCTION__);
@@ -625,6 +701,8 @@ UInt32 itlwm::outputPacket(mbuf_t m, void *param)
     if (!ifp->if_snd.queue->lockEnqueue(m)) {
         freePacket(m);
         ret = kIOReturnOutputDropped;
+    } else {
+        iwxabS202NoteEnqueue(m);
     }
     (*ifp->if_start)(ifp);
     return ret;

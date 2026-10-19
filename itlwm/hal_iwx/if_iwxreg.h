@@ -80,6 +80,22 @@
 #define IWX_CSR_IML_DATA_ADDR               0x120
 #define IWX_CSR_IML_SIZE_ADDR               0x128
 #define IWX_CSR_IML_RESP_ADDR               0x12c
+/*
+ * S162: THE HOST-SIDE DOORBELL REGISTER, AND THE ONE REGISTER THE PORT WAS
+ * MISSING FOR THE FIRMWARE RESET HANDSHAKE.
+ * Linux `iwl-csr.h:122-125`:
+ *     Doorbell - since Bz
+ *     connected to UREG_DOORBELL_TO_ISR6 (lower 16 bits only)
+ *     #define CSR_DOORBELL_VECTOR (CSR_BASE + 0x130)
+ * with CSR_BASE = 0x000, so the BAR0 offset is 0x130 exactly.  The reference
+ * writes it, on a family ABOVE AX210 i.e. on this Bz part, as the reset request
+ * (`pcie/gen1_2/trans-gen2.c:113-116`:
+ * `iwl_write32(trans, CSR_DOORBELL_VECTOR, UREG_DOORBELL_TO_ISR6_RESET_HANDSHAKE)`).
+ * The port's ONLY existing doorbell user is `iwx_load_pnvm`, and it goes through
+ * `iwx_write_umac_prph()` to the UMAC-side alias, so this BAR0 register had never
+ * been named or written here (`grep -c CSR_DOORBELL` on the pre-image = 0).
+ */
+#define IWX_CSR_DOORBELL_VECTOR        (0x130)
 
 /* Set bit for enabling automatic function boot */
 #define IWX_CSR_AUTO_FUNC_BOOT_ENA          (1 << 1)
@@ -362,6 +378,22 @@ struct iwx_prph_scratch_pnvm_cfg {
 } __packed; /* PERIPH_SCRATCH_PNVM_CFG_S */
 
 /*
+ * Round S42: the SEGMENTED PNVM handoff.  When the firmware advertises
+ * IWX_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG, prph_scratch.ctrl_cfg.pnvm_cfg
+ * .pnvm_base_addr must point at THIS descriptor array (not at the payload), and
+ * each entry is the address of one PNVM payload; pnvm_size stays the total
+ * payload size in bytes.
+ * Linux: struct iwl_prph_scratch_mem_desc_addr_array (pcie/iwl-context-info-v2.h:137),
+ * filled by iwl_pcie_load_payloads_segments() (pcie/ctxt-info-v2.c:378-436) and
+ * published by iwl_pcie_set_pnvm_segments() (:511-523);
+ * IPC_DRAM_MAP_ENTRY_NUM_MAX = 64 (iwl-trans.h:470).
+ */
+#define IWX_PNVM_MEM_DESC_MAX    64
+struct iwx_prph_scratch_mem_desc_addr_array {
+    __le64 mem_descs[IWX_PNVM_MEM_DESC_MAX];
+} __packed; /* PERIPH_SCRATCH_MEM_DESC_ADDR_ARRAY_S_VER_1 */
+
+/*
  * struct iwx_prph_scratch_hwm_cfg - hwm config
  * @hwm_base_addr: hwm start address
  * @hwm_size: hwm size in DWs
@@ -384,6 +416,30 @@ struct iwx_prph_scratch_rbd_cfg {
 } __packed; /* PERIPH_SCRATCH_RBD_CFG_S */
 
 /*
+ * struct iwx_prph_scratch_reduce_power_cfg - prph scratch reduce power table
+ * @base_addr: reduce power table address
+ * @size: table size
+ * @reserved: reserved
+ * (Linux: struct iwl_prph_scratch_uefi_cfg)
+ */
+struct iwx_prph_scratch_reduce_power_cfg {
+    __le64 base_addr;
+    __le32 size;
+    __le32 reserved;
+} __packed; /* PERIPH_SCRATCH_UEFI_CFG_S */
+
+/*
+ * struct iwx_prph_scratch_step_cfg - prph scratch step configuration
+ * @mbx_addr_0: [0:7] revision, [8:15] cnvi_to_cnvr length,
+ *              [16:23] cnvr_to_cnvi channel length, [24:31] radio1 reserved
+ * @mbx_addr_1: [0:7] radio2 reserved
+ */
+struct iwx_prph_scratch_step_cfg {
+    __le32 mbx_addr_0;
+    __le32 mbx_addr_1;
+} __packed;
+
+/*
  * struct iwx_prph_scratch_ctrl_cfg - prph scratch ctrl and config
  * @version: version information of context info and HW
  * @control: control flags of FH configurations
@@ -397,6 +453,8 @@ struct iwx_prph_scratch_ctrl_cfg {
     struct iwx_prph_scratch_pnvm_cfg pnvm_cfg;
     struct iwx_prph_scratch_hwm_cfg hwm_cfg;
     struct iwx_prph_scratch_rbd_cfg rbd_cfg;
+    struct iwx_prph_scratch_reduce_power_cfg reduce_power_cfg;
+    struct iwx_prph_scratch_step_cfg step_cfg;
 } __packed; /* PERIPH_SCRATCH_CTRL_CFG_S */
 
 /*
@@ -406,9 +464,47 @@ struct iwx_prph_scratch_ctrl_cfg {
  * @reserved: reserved
  */
 struct iwx_prph_scratch {
-    struct iwx_prph_scratch_ctrl_cfg ctrl_cfg;
-    __le32 reserved[16];
+    struct iwx_prph_scratch_ctrl_cfg ctrl_cfg;   /* 84, identical to Linux */
+    /*
+     * Linux has fseq_override (4) + step_analog_params (4) + reserved[8] (32) = 40
+     * here, putting offsetof(dram) at 124. Both layouts were compiled from their own
+     * real headers to confirm:
+     *
+     *   LINUX  ctrl_cfg=84  offsetof(dram)=124  sizeof=1660 (415 words)
+     *   PORT   ctrl_cfg=84  offsetof(dram)=124  sizeof=1660 (415 words)
+     *
+     * The port previously used reserved[7] (28), which put dram at 112 - twelve bytes
+     * early - and an earlier attempt "fixed" it to 96 using incorrect hand arithmetic.
+     * Both were wrong; dram must be at 124, which is where the uCode reads its
+     * LMAC/UMAC/paging section addresses from. Keep this at reserved[10] so the layout
+     * matches Linux exactly.
+     */
+    __le32 reserved[10];
     struct iwx_context_info_dram dram;
+    /*
+     * ==== FIX (round S59): THIS STRUCT WAS 64 BYTES SHORT ===================
+     * MEASURED (S55 Linux reference run -- the working driver's own buffer):
+     *   IWXAB SCRATCH[000]: 00000461 000001af 000f0000 00000000 ...
+     * Word 1 of prph_scratch is version.size, and Linux writes it as
+     * `prph_sc_ctrl->version.size = cpu_to_le16(sizeof(*prph_scratch) / 4)`
+     * (pcie/ctxt-info-v2.c:156).  0x1af = 431 dwords = 1724 bytes, while this
+     * port's struct is 1660 bytes = 415 dwords and declares 415 to the firmware.
+     * The 64-byte difference is exactly Linux's `dram.fseq_img[8]`
+     * (IWL_NUM_DRAM_FSEQ_ENTRIES, pcie/iwl-context-info-v2.h:203-220), whose
+     * tail is asserted by a BUILD_BUG_ON:
+     *   offsetofend(dram.common) + sizeof(dram.fseq_img) == sizeof(*prph_scratch)
+     * Arithmetic, both sides: ctrl_cfg(84) + fseq_override(4) +
+     * step_analog_params(4) + reserved[10](40) + dram.common(3 x 64 x 8 = 1536)
+     * = 1660 for this port, plus fseq_img(64) = 1724 for Linux.
+     * RETRACTION, in place rather than deleted: the comment above records an
+     * earlier round's claim that both layouts "compiled from their own real
+     * headers" to 415 words.  That was wrong, and it is precisely why this field
+     * was never checked -- the measured size from the driver that works is 431.
+     * The firmware consumes this size; this is the only divergence left in the
+     * init parameters handed to it (the mac_id divergence, fix 7, was the
+     * previous one).
+     */
+    uint64_t fseq_img[8];
 } __packed; /* PERIPH_SCRATCH_S */
 
 /*
@@ -583,6 +679,17 @@ enum iwx_fw_ini_allocation_id {
 #define IWX_CSR_GPIO_IN             (0x018) /* read external chip pins */
 #define IWX_CSR_RESET               (0x020) /* busmaster enable, NMI, etc*/
 #define IWX_CSR_GP_CNTRL            (0x024)
+/*
+ * Scratch register - used for FW debug.  For Bz the host must write
+ * IWX_CSR_FUNC_SCRATCH_INIT_VALUE here as part of the firmware start
+ * sequence, immediately before setting IWX_CSR_GP_CNTRL_REG_FLAG_ROM_START:
+ * Linux iwl_trans_pcie_gen2_start_fw() (pcie/trans-gen2.c:526-537) takes a
+ * dedicated "device_family >= IWL_DEVICE_FAMILY_BZ" branch that writes this
+ * register and then sets ROM_START, and does NOT write UREG_CPU_INIT_RUN
+ * (that is the ">= AX210" branch).  Offsets match iwl-csr.h:36-37, 150, 289.
+ */
+#define IWX_CSR_FUNC_SCRATCH        (0x02c) /* Scratch register - used for FW dbg */
+#define IWX_CSR_FUNC_SCRATCH_INIT_VALUE    (0x01010101)
 
 /* 2nd byte of IWX_CSR_INT_COALESCING, not accessible via iwl_write32()! */
 #define IWX_CSR_INT_PERIODIC_REG    (0x005)
@@ -762,6 +869,29 @@ enum iwx_fw_ini_allocation_id {
 #define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY        (0x00000001)
 #define IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE              (0x00000004)
 #define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ         (0x00000008)
+/*
+ * Bz uses a DIFFERENT MAC-access handshake from earlier generations. Linux's
+ * __iwl_trans_pcie_grab_nic_access special-cases it:
+ *
+ *     if (trans->trans_cfg->device_family >= IWL_DEVICE_FAMILY_BZ) {
+ *         write = CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ;   // BIT(21)
+ *         mask  = CSR_GP_CNTRL_REG_FLAG_MAC_STATUS;          // BIT(20)
+ *         poll  = CSR_GP_CNTRL_REG_FLAG_MAC_STATUS;
+ *     }
+ *
+ * i.e. the request bit is BIT(21), not BIT(3), and the status to wait for is
+ * BIT(20) (MAC_STATUS), not BIT(0) (MAC_CLOCK_READY). Using the legacy bits on
+ * Bz means the request is never seen and access is never granted, which
+ * deadlocks the whole bring-up: INIT_DONE cannot be written without access, and
+ * the clock cannot become ready without INIT_DONE.
+ */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ      (0x00200000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS             (0x00100000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_INIT               (0x00000040)  /* BIT(6)  */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_ROM_START              (0x00000080)  /* BIT(7)  */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS (0x10000000) /* BIT(28) */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_REQ    (0x20000000) /* BIT(29) */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_SW_RESET               (0x80000000)  /* BIT(31) */
 #define IWX_CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP         (0x00000010)
 
 #define IWX_CSR_GP_CNTRL_REG_VAL_MAC_ACCESS_EN           (0x00000001)
@@ -1052,7 +1182,12 @@ enum iwx_fw_ini_allocation_id {
 #define IWX_RADIO_REG_SYS_MANUAL_DFT_0        0xad4078
 #define IWX_RFIC_REG_RD                0xad0470
 #define IWX_WFPM_CTRL_REG            0xa03030
-#define IWX_WFPM_AUX_CTL_AUX_IF_MAC_OWNER_MSK    0x08000000
+/* ==== S94 correction: Linux has 0x80000000.  This port carried 0x08000000 -- a
+ * TRANSPOSED DIGIT -- so ANY use of this named constant would set the wrong bit.  Corrected
+ * to Linux's value (iwl-prph.h:368).  It is referenced NOWHERE in ItlIwx.cpp/ItlIwx.hpp,
+ * checked before and after, so this cannot change any other behaviour.  The S94 block
+ * writes the LITERAL 0x80000000u on purpose.  KEEP THE VALUE, NOT THIS COMMENT. ==== */
+#define IWX_WFPM_AUX_CTL_AUX_IF_MAC_OWNER_MSK    0x80000000
 #define IWX_ENABLE_WFPM                0x80000000
 
 #define IWX_AUX_MISC_MASTER1_EN            0xa20818
@@ -1126,6 +1261,31 @@ enum iwx_fw_ini_allocation_id {
 #define IWX_CSR_MSIX_FH_INT_MASK_AD        (IWX_CSR_MSIX_BASE + 0x804)
 #define IWX_CSR_MSIX_HW_INT_CAUSES_AD        (IWX_CSR_MSIX_BASE + 0x808)
 #define IWX_CSR_MSIX_HW_INT_MASK_AD        (IWX_CSR_MSIX_BASE + 0x80C)
+
+/* ==== S164 REGISTER DEFINITION: CSR_IPC_STATE -- THE PORT NEVER DEFINED IT ====================
+ * *** THIS READ IS OURS, AND THE RECEIPT LABELS IT SO. ***  The reference's bit-2 handler
+ * classifies the interrupt by `CSR_IPC_STATE` ONLY when `device_family >= SC`
+ * (`03-notes/linux-ref-7.2.8/pcie/gen1_2/rx.c:1846-1853`: `if (trans->mac_cfg->device_family >=
+ * IWL_DEVICE_FAMILY_SC) { val = iwl_read32(trans, CSR_IPC_STATE); state =
+ * u32_get_bits(val, CSR_IPC_STATE_RESET); } else { state = CSR_IPC_STATE_RESET_SW_READY; }`).
+ * Bz < SC, so on THIS part Linux HARDCODES `SW_READY` and NO reference driver ever reads the
+ * register -- the port had no definition at all before this round.  The read exists only to
+ * answer the pre-registered question "what does the firmware's own IPC handshake read at the
+ * halt", and it must never be presented as ported behaviour.
+ * The register is in the shared CSR map: `iwl-csr.h:27` `#define CSR_BASE (0x000)` and `:110`
+ * `#define CSR_IPC_STATE (CSR_BASE + 0x110)`; the RESET field is `:111` `0x00000030` with the
+ * values `:112-115` NONE=0 SW_READY=1 TOP_READY=2 TOP_FOLLOWER=3, and `:116` TOP_RESET_REQ=BIT(6).
+ * Accessor and window (0q21): BAR0 offset 0x110, `IWX_READ` -> `iwxabS90Rd` ->
+ * `bus_space_read_4`; NO nic lock and NO prph, so it is safe on a halted device.
+ * ============================================================================================ */
+#define IWX_CSR_IPC_STATE               (0x110)
+#define IWX_CSR_IPC_STATE_RESET         0x00000030
+#define IWX_CSR_IPC_STATE_RESET_NONE        0
+#define IWX_CSR_IPC_STATE_RESET_SW_READY    1
+#define IWX_CSR_IPC_STATE_RESET_TOP_READY   2
+#define IWX_CSR_IPC_STATE_RESET_TOP_FOLLOWER 3
+#define IWX_CSR_IPC_STATE_TOP_RESET_REQ     (1 << 6)
+/* ==== END S164 REGISTER DEFINITIONS ======================================================== */
 #define IWX_CSR_MSIX_AUTOMASK_ST_AD        (IWX_CSR_MSIX_BASE + 0x810)
 #define IWX_CSR_MSIX_RX_IVAR_AD_REG        (IWX_CSR_MSIX_BASE + 0x880)
 #define IWX_CSR_MSIX_IVAR_AD_REG        (IWX_CSR_MSIX_BASE + 0x890)
@@ -1153,6 +1313,16 @@ enum iwx_msix_hw_int_causes {
     IWX_MSIX_HW_INT_CAUSES_REG_WAKEUP    = (1 << 1),
     IWX_MSIX_HW_INT_CAUSES_REG_IPC        = (1 << 1),
     IWX_MSIX_HW_INT_CAUSES_REG_IML        = (1 << 2),
+    /* S162: bit 2's ACTUAL name on this part, and the name the reference
+     * dispatches on.  `IWX_MSIX_HW_INT_CAUSES_REG_IML` above is a verbatim copy
+     * of the 9000-series `hal_iwm` enum (`hal_iwm/if_iwmreg.h:719`) where bit 2
+     * means something else; Linux calls bit 2 `RESET_DONE` (`iwl-csr.h:632-634`:
+     * WAKEUP = BIT(1), IML = BIT(1), RESET_DONE = BIT(2)) and BSD v1.230 has no
+     * `IML` name at all (`if_iwxreg.h:1176` -- `RESET_DONE`).  Ledger section
+     * 126(A) corrected this; the old name is left untouched because nothing in
+     * the port tests it (it appears only in iwx_conf_msix_hw's unmask list), and
+     * the reset handshake needs the correct name to dispatch on. */
+    IWX_MSIX_HW_INT_CAUSES_REG_RESET_DONE    = (1 << 2),
     IWX_MSIX_HW_INT_CAUSES_REG_SW_ERR_V2    = (1 << 5),
     IWX_MSIX_HW_INT_CAUSES_REG_CT_KILL    = (1 << 6),
     IWX_MSIX_HW_INT_CAUSES_REG_RF_KILL    = (1 << 7),
@@ -1192,11 +1362,24 @@ enum iwx_msix_ivar_for_cause {
  *                     HW address related registers                          *
  *****************************************************************************/
 
-#define IWX_CSR_ADDR_BASE            (0x380)
-#define IWX_CSR_MAC_ADDR0_OTP        (IWX_CSR_ADDR_BASE)
-#define IWX_CSR_MAC_ADDR1_OTP        (IWX_CSR_ADDR_BASE + 4)
-#define IWX_CSR_MAC_ADDR0_STRAP        (IWX_CSR_ADDR_BASE + 8)
-#define IWX_CSR_MAC_ADDR1_STRAP        (IWX_CSR_ADDR_BASE + 0xC)
+/* ==== S103f (rule 0fx): THE MAC-ADDRESS CSR BASE IS DEVICE-FAMILY DEPENDENT ==========
+ * Mirrors the reference's TABLE, not one family's value:
+ *     iwl-csr.h:655   CSR_ADDR_BASE(trans) = trans->mac_cfg->base->mac_addr_from_csr
+ *     cfg/9000.c  0x380     cfg/22000.c 0x380     cfg/ax210.c 0x380
+ *     cfg/bz.c    0x30      cfg/dr.c    0x30      cfg/sc.c    0x30
+ * The port carried the AX210 value as a literal, and on this Bz silicon the reference's
+ * own trace reads io[0x38]=0x0, io[0x3c]=0x0 (STRAP invalid) and io[0x30]=0xc895ce50,
+ * io[0x34]=0x4795 (OTP valid) -- i.e. the MAC lives at 0x30 here, not 0x380.  The reads,
+ * the STRAP->OTP order and iwx_flip_hw_address() are otherwise byte-identical to the
+ * reference's.  The macros take `sc` because the family, like the reference's, is a
+ * property of the device in hand. ================================================== */
+#define IWX_CSR_ADDR_BASE_AX210        (0x380)
+#define IWX_CSR_ADDR_BASE_BZ        (0x30)
+#define IWX_CSR_ADDR_BASE(sc)     ((sc)->sc_device_family >= IWX_DEVICE_FAMILY_BZ ?      IWX_CSR_ADDR_BASE_BZ : IWX_CSR_ADDR_BASE_AX210)
+#define IWX_CSR_MAC_ADDR0_OTP(sc)    (IWX_CSR_ADDR_BASE(sc))
+#define IWX_CSR_MAC_ADDR1_OTP(sc)    (IWX_CSR_ADDR_BASE(sc) + 4)
+#define IWX_CSR_MAC_ADDR0_STRAP(sc)    (IWX_CSR_ADDR_BASE(sc) + 8)
+#define IWX_CSR_MAC_ADDR1_STRAP(sc)    (IWX_CSR_ADDR_BASE(sc) + 0xC)
 
 /**
  * uCode API flags
@@ -1387,6 +1570,17 @@ enum iwx_msix_ivar_for_cause {
 #define IWX_UCODE_TLV_CAPA_LAR_MULTI_MCC        29
 #define IWX_UCODE_TLV_CAPA_BT_COEX_RRC            30
 #define IWX_UCODE_TLV_CAPA_GSCAN_SUPPORT        31
+/*
+ * Round S42: the firmware advertises this bit, and it selects the SHAPE of the
+ * PNVM handoff (a descriptor array instead of one contiguous payload).
+ * Linux: IWL_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG = 32 (fw/file.h:481), consumed
+ * by iwl_trans_pcie_ctx_info_v2_load_pnvm() (pcie/ctxt-info-v2.c:468).
+ * Measured offline from this silicon's own image
+ * (05-artifacts/firmware/iwlwifi-bz-b0-fm-c0-c106.ucode, TLV type 30
+ * IWL_UCODE_TLV_ENABLED_CAPABILITIES at offset 2316): api_index=1,
+ * api_capa=0xff7f7aeb -> bit 32 SET.
+ */
+#define IWX_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG        32
 #define IWX_UCODE_TLV_CAPA_NAN_SUPPORT            34
 #define IWX_UCODE_TLV_CAPA_UMAC_UPLOAD            35
 #define IWX_UCODE_TLV_CAPA_BINDING_CDB_SUPPORT        39
@@ -1398,6 +1592,10 @@ enum iwx_msix_ivar_for_cause {
 #define IWX_UCODE_TLV_CAPA_SET_LTR_GEN2             50
 #define IWX_UCODE_TLV_CAPA_SET_PPAG                 52
 #define IWX_UCODE_TLV_CAPA_SESSION_PROT_CMD         54
+/* S216: Linux `IWL_UCODE_TLV_CAPA_FW_RESET_HANDSHAKE` (fw/file.h:499).  The image
+ * on this silicon advertises it (TLV type 30, api_index=1, api_capa=0xff7f7aeb,
+ * bit 57 SET), and the MVM path gates the reset handshake on it (mvm/ops.c:1415). */
+#define IWX_UCODE_TLV_CAPA_FW_RESET_HANDSHAKE       57
 #define IWX_UCODE_TLV_CAPA_EXTENDED_DTS_MEASURE        64
 #define IWX_UCODE_TLV_CAPA_SHORT_PM_TIMEOUTS        65
 #define IWX_UCODE_TLV_CAPA_BT_MPLUT_SUPPORT        67
@@ -1414,7 +1612,26 @@ enum iwx_msix_ivar_for_cause {
 #define IWX_UCODE_TLV_CAPA_LQM_SUPPORT            81
 #define IWX_UCODE_TLV_CAPA_LED_CMD_SUPPORT        88
 
-#define IWX_NUM_UCODE_TLV_CAPA 128
+/*
+ * MLD API support -- the firmware's own capability bit (TLV 30 ENABLED_CAPABILITIES, bit 110).
+ * The reference selects the MLD op mode on exactly this bit (mvm/mvm.h iwl_mvm_has_mld_api() ->
+ * mvm/ops.c:1226) and it is also the FIRST disjunct of iwl_mvm_has_new_station_api()
+ * (mvm/mvm.h:1499-1501), which is what the reference's own aux-station site tests (mvm/fw.c:1796).
+ * THIS firmware sets it: measured offline in the image the driver loads (md5
+ * 0f66e5beb95fff533664b5e5e5005694), and Linux on this silicon loads `op_mode iwlmld`.
+ * Rule 0fx: the family/API-dependent fact is mirrored as the reference's own NAMED bit, not a literal.
+ */
+#define IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT        110
+
+/*
+ * Bz firmware sends IWX_UCODE_TLV_ENABLED_CAPABILITIES with api_index = 4,
+ * i.e. a FIFTH 32-bit capability word. With the AX210-era size of 128 the guard
+ * in iwx_read_firmware is 'if (idx >= howmany(128,32)) goto parse_out', so
+ * howmany == 4 and api_index 4 triggers a SILENT early exit (err is not set),
+ * abandoning the rest of the firmware image - including the IML TLV - which
+ * leaves sc_iml_len == 0 and hands the uCode an empty image-loader table.
+ * Widen to cover the indices this firmware actually uses. */
+#define IWX_NUM_UCODE_TLV_CAPA 256
 
 /*
  * For 16.0 uCode and above, there is no differentiation between sections,
@@ -1674,6 +1891,37 @@ struct iwx_rx_completion_desc {
     uint8_t reserved2[25];
 } __packed;
 
+/**
+ * ==== FIX (round S10, Build B, uncommitted): THE Bz COMPLETION DESCRIPTOR ====
+ * Linux has a SEPARATE, much smaller completion descriptor for Bz and selects
+ * it by family, ahead of the AX210 one:
+ *
+ *   pcie/internal.h:
+ *     struct iwl_rx_completion_desc    { __le32 reserved1; __le16 rbid; u8 flags;
+ *                                        u8 reserved2[25]; } __packed;  32 B (AX210)
+ *     struct iwl_rx_completion_desc_bz { __le16 rbid; u8 flags;
+ *                                        u8 reserved[1]; } __packed;     4 B (Bz)
+ *   pcie/rx.c: iwl_pcie_used_bd_size()
+ *     if (device_family >= IWL_DEVICE_FAMILY_BZ)        -> sizeof(..._bz)   4 B
+ *     if (device_family >= IWL_DEVICE_FAMILY_AX210)     -> sizeof(...)     32 B
+ *     else                                              -> sizeof(__le32)
+ *
+ * The migration off the AX210 struct is guarded in Linux by
+ * BUILD_BUG_ON(sizeof(struct iwl_rx_completion_desc_bz) != 4) (pcie/rx.c:1455).
+ * This struct is 4 bytes: rbid 2 + flags 1 + reserved 1.
+ *
+ * Why it matters even though this port never parses the used-BD array (it
+ * reads rb_stts, ItlIwx.cpp iwx_rx_intr): the array is what
+ * ctxt_info_gen3->mcr_base_addr points the firmware at, and its element size
+ * defines the stride the device writes with.  The port and the firmware must
+ * agree on the geometry of that ring even if only one of them reads it.
+ */
+struct iwx_rx_completion_desc_bz {
+    uint16_t rbid;
+    uint8_t flags;
+    uint8_t reserved[1];
+} __packed;
+
 
 #define IWX_TFD_QUEUE_SIZE_MAX        (256)
 #define IWX_TFD_QUEUE_SIZE_MAX_GEN3    (65536)
@@ -1818,6 +2066,38 @@ enum iwx_gen2_tx_fifo {
 #define IWX_TX_QUEUE_CFG_TFD_SHORT_FORMAT    (1 << 1)
 
 #define IWX_DEFAULT_QUEUE_SIZE IWX_TFD_QUEUE_SIZE_MAX
+/*
+ * ==== TX SCHEDULER (SCD) STATE, round S56 ==================================
+ * iwl-scd.h / iwl-prph.h.  The question these reads answer is the one the whole
+ * S43-S55 investigation could not: **does the firmware FETCH this driver's
+ * TFDs?**  The firmware answers `INIT_EXTENDED_CFG_CMD` (so it fetched TFD 0)
+ * and ignores `PHY_CONFIGURATION_CMD`; those are two very different failures --
+ * "never fetched TFD 1" is a queue/credit/transport problem, "fetched it and
+ * declined" is a firmware-internal one.  Linux's own `iwl_pcie_dump_...` reads
+ * exactly these registers for its "queue is stuck" diagnostic
+ * (pcie/gen1_2/tx.c:687-698) and skips them for gen2+ devices, where the SCD's
+ * queue state lives in DEVICE MEMORY at the address read from
+ * IWX_SCD_SRAM_BASE_ADDR (iwl-scd.h:48-72, pcie/gen1_2/tx.c:1223-1231).
+ */
+#define IWX_SCD_BASE                    0xa02c00
+#define IWX_SCD_SRAM_BASE_ADDR          (IWX_SCD_BASE + 0x00)
+#define IWX_SCD_TXFACT                  (IWX_SCD_BASE + 0x10)
+#define IWX_SCD_ACTIVE                  (IWX_SCD_BASE + 0x14)
+#define IWX_SCD_CONTEXT_MEM_LOWER_BOUND 0x0600
+#define IWX_SCD_TX_STTS_MEM_LOWER_BOUND 0x06a0
+#define IWX_SCD_CONTEXT_QUEUE_OFFSET(x) (IWX_SCD_CONTEXT_MEM_LOWER_BOUND + ((x) * 8))
+#define IWX_SCD_TX_STTS_QUEUE_OFFSET(x) (IWX_SCD_TX_STTS_MEM_LOWER_BOUND + ((x) * 16))
+#define IWX_SCD_QUEUE_WRPTR(x)          (IWX_SCD_BASE + 0x18 + ((x) * 4))
+#define IWX_SCD_QUEUE_RDPTR(x)          (IWX_SCD_BASE + 0x68 + ((x) * 4))
+#define IWX_SCD_QUEUE_STATUS_BITS(x)    (IWX_SCD_BASE + 0x10c + ((x) * 4))
+#define IWX_SCD_QUEUE_STTS_REG_POS_TXF      0
+#define IWX_SCD_QUEUE_STTS_REG_POS_ACTIVE   3
+#define IWX_SCD_QUEUE_STTS_REG_POS_WSL      4
+#define IWX_SCD_QUEUE_CTX_REG1_CREDIT       0x00ffff00
+#define IWX_SCD_QUEUE_CTX_REG1_SUPER_CREDIT 0xff000000
+#define IWX_SCD_QUEUE_CTX_REG2_WIN_SIZE     0x0000007f
+#define IWX_SCD_QUEUE_CTX_REG2_FRAME_LIMIT  0x007f0000
+
 #define IWX_CMD_QUEUE_SIZE  32
 #define IWX_CMD_QUEUE_SIZE_GEN3 128
 #define IWX_MIN_256_BA_QUEUE_SIZE_GEN3 1024
@@ -1855,6 +2135,69 @@ struct iwx_tx_queue_cfg_rsp {
     uint16_t reserved;
 } __packed; /* TX_QUEUE_CFG_RSP_API_S_VER_2 */
 
+/*
+ * S103k: the version-3 form of the queue-allocation command.  Mirrors fw/api/datapath.h:581-632
+ * (`enum iwl_scd_queue_cfg_operation`, `struct iwl_scd_queue_cfg_cmd`, TX_QUEUE_CFG_CMD_API_S_VER_3).
+ * The RESPONSE is unchanged -- `struct iwx_tx_queue_cfg_rsp` above ("the response is (same as
+ * before)", datapath.h:84-85) -- so no response struct is added and the senders' parsing is untouched.
+ * 36 bytes packed: 4 (operation) + 32 (the largest union member, `add`).
+ */
+
+/**
+ * enum iwx_scd_queue_cfg_operation - scheduler queue operation
+ * @IWX_SCD_QUEUE_ADD: allocate a new queue
+ * @IWX_SCD_QUEUE_REMOVE: remove a queue
+ * @IWX_SCD_QUEUE_MODIFY: modify a queue
+ */
+enum iwx_scd_queue_cfg_operation {
+    IWX_SCD_QUEUE_ADD = 0,
+    IWX_SCD_QUEUE_REMOVE = 1,
+    IWX_SCD_QUEUE_MODIFY = 2,
+};
+
+/**
+ * struct iwx_scd_queue_cfg_cmd - scheduler queue allocation command (API version 3)
+ * @operation: the operation, see &enum iwx_scd_queue_cfg_operation
+ * @u: union depending on command usage
+ * @u.add.sta_mask: station mask (the reference's callers pass BIT(sta_id); the OLD form derived
+ *    sta_id = ffs(sta_mask) - 1 from the same value)
+ * @u.add.tid: TID
+ * @u.add.reserved: reserved
+ * @u.add.flags: flags from &enum iwl_tx_queue_cfg_actions, except
+ *    %IWX_TX_QUEUE_CFG_ENABLE_QUEUE is NOT valid here
+ * @u.add.cb_size: size code
+ * @u.add.bc_dram_addr: byte-count table IOVA
+ * @u.add.tfdq_dram_addr: TFD queue IOVA
+ * @u.remove.sta_mask: station mask of queue to remove
+ * @u.remove.tid: TID of queue to remove
+ * @u.modify.old_sta_mask: old station mask for modify
+ * @u.modify.tid: TID of queue to modify
+ * @u.modify.new_sta_mask: new station mask for modify
+ */
+struct iwx_scd_queue_cfg_cmd {
+    uint32_t operation;
+    union {
+        struct {
+            uint32_t sta_mask;
+            uint8_t tid;
+            uint8_t reserved[3];
+            uint32_t flags;
+            uint32_t cb_size;
+            uint64_t bc_dram_addr;
+            uint64_t tfdq_dram_addr;
+        } __packed add; /* TX_QUEUE_CFG_CMD_ADD_API_S_VER_1 */
+        struct {
+            uint32_t sta_mask;
+            uint32_t tid;
+        } __packed remove; /* TX_QUEUE_CFG_CMD_REMOVE_API_S_VER_1 */
+        struct {
+            uint32_t old_sta_mask;
+            uint32_t tid;
+            uint32_t new_sta_mask;
+        } __packed modify; /* TX_QUEUE_CFG_CMD_MODIFY_API_S_VER_1 */
+    } __packed u; /* TX_QUEUE_CFG_CMD_OPERATION_API_U_VER_1 */
+} __packed; /* TX_QUEUE_CFG_CMD_API_S_VER_3 */
+
 
 /*
  * Commands
@@ -1878,6 +2221,86 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_ADD_STA_KEY    0x17
 #define IWX_ADD_STA    0x18
 #define IWX_REMOVE_STA    0x19
+
+/*
+ * ==== S103ag B5a: THE MLD KEY-INSTALL COMMAND =================================================
+ * MEASURED, this round, from the firmware images themselves
+ * (05-artifacts/s103ag/s103ag-tlv-blast-radius.txt, re-runnable tools/s103ag-tlv-blast.py):
+ *   (0x01,0x17) IWX_ADD_STA_KEY  declared by 12 of 13 images (cmd_ver 3);
+ *                                ABSENT from the Bz image -- the image the card runs.
+ *   (0x05,0x18) IWX_SEC_KEY_CMD  declared by EXACTLY 1 of 13 images -- the Bz image, cmd_ver 1;
+ *                                declared by NONE of the other twelve.
+ * The two sets are COMPLEMENTARY.  The reference selects on the TLV-48 ROW, not on the op mode:
+ *   upstream iwx  if_iwx.c:9533-9540
+ *       sec_key_ver = iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP, IWX_SEC_KEY_CMD);
+ *       if (sec_key_ver != 0 && sec_key_ver != IWX_FW_CMD_VER_UNKNOWN)
+ *               err = iwx_mld_set_sta_key_cmd(sc, sta_id, ni, k, 0);
+ *       else if (k->k_flags & IEEE80211_KEY_IGTK) err = iwx_set_sta_igtk(...);
+ *       else                                       err = iwx_add_sta_key_cmd(...);
+ *   Linux MLD     mld/key.c:187 (add) / :210 (remove)   WIDE_ID(DATA_PATH_GROUP, SEC_KEY_CMD)
+ *   Linux id      fw/api/datapath.h:92                  SEC_KEY_CMD = 0x18
+ * The reference's own lookup on the Bz image returns 1, so the reference takes the MLD branch,
+ * and the port's unconditional legacy send is the branch the reference REJECTS.
+ * This is the same shape as repair #9, which routed the queue allocation through
+ * IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SCD_QUEUE_CONFIG_CMD) and was MEASURED working in S103y.
+ * ==============================================================================================
+ */
+#define IWX_SEC_KEY_CMD        0x18
+
+/* enum iwx_sec_key_flags -- upstream if_iwxreg.h:6321-6331 == Linux fw/api/datapath.h:648-658 */
+enum iwx_sec_key_flags {
+    IWX_SEC_KEY_FLAG_CIPHER_MASK    = 0x07,
+    IWX_SEC_KEY_FLAG_CIPHER_WEP    = 0x01,
+    IWX_SEC_KEY_FLAG_CIPHER_CCMP    = 0x02,
+    IWX_SEC_KEY_FLAG_CIPHER_TKIP    = 0x03,
+    IWX_SEC_KEY_FLAG_CIPHER_GCMP    = 0x05,
+    IWX_SEC_KEY_FLAG_NO_TX        = 0x08,
+    IWX_SEC_KEY_FLAG_KEY_SIZE    = 0x10,
+    IWX_SEC_KEY_FLAG_MFP        = 0x20,
+    IWX_SEC_KEY_FLAG_MCAST_KEY    = 0x40,
+    IWX_SEC_KEY_FLAG_SPP_AMSDU    = 0x80,
+};
+
+/* SEC_KEY_CMD_API_S_VER_1 -- upstream if_iwxreg.h:6355-6381 == Linux fw/api/datapath.h:682-707.
+ * CLOSED FIELD SET: action; u.add{sta_mask,key_id,key_flags,key[32],tkip_mic_rx_key[8],
+ * tkip_mic_tx_key[8],rx_seq,tx_seq}; u.modify{old_sta_mask,new_sta_mask,key_id,key_flags};
+ * u.remove{sta_mask,key_id,key_flags}.  sizeof == 80, asserted below and in s103ag-asserts.c. */
+struct iwx_sec_key_cmd {
+    uint32_t action;
+    union {
+        struct {
+            uint32_t sta_mask;
+            uint32_t key_id;
+            uint32_t key_flags;
+            uint8_t key[32];
+            uint8_t tkip_mic_rx_key[8];
+            uint8_t tkip_mic_tx_key[8];
+            uint64_t rx_seq;
+            uint64_t tx_seq;
+        } __packed add;
+        struct {
+            uint32_t old_sta_mask;
+            uint32_t new_sta_mask;
+            uint32_t key_id;
+            uint32_t key_flags;
+        } __packed modify;
+        struct {
+            uint32_t sta_mask;
+            uint32_t key_id;
+            uint32_t key_flags;
+        } __packed remove;
+    } __packed u;
+} __packed;
+
+/*
+ * ==== S103ag B5a's six COMPILE-TIME IDENTITY GATES lived HERE and DID NOT COMPILE =============
+ * S103ah G2: this is FIXES.md `0ih` -- they were placed at :2244 while the macros they use are
+ * defined at :2379 (IWX_DATA_PATH_GROUP), :3385/:3387 (IWX_FW_CTXT_ACTION_ADD/_REMOVE) and :9239
+ * (IWX_WIDE_ID).  Measured: 16 errors across 4 translation units.
+ * THEY WERE NOT DELETED.  They now sit immediately after `#define IWX_WIDE_ID`, which is the last
+ * of their four dependencies -- search for `S103ah B5-02 RELOCATION`.
+ * ============================================================================================
+ */
 
 /* TX */
 #define IWX_TX_CMD        0x1c
@@ -1964,6 +2387,26 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_REPLY_DEBUG_CMD    0xf0
 #define IWX_DEBUG_LOG_MSG    0xf7
 
+/* ==== S220: Linux's "disable debug asserts" token (LONG group, 0xf6) =====================
+ * Linux 7.2.8, by body:
+ *   fw/api/commands.h:519   LDBG_CONFIG_CMD = 0xf6  (enum iwl_legacy_cmds)
+ *   fw/api/commands.h:39    LONG_GROUP = 0x1
+ *   fw/api/cmdhdr.h:51      WIDE_ID(grp, opcode) = ((grp) << 8) | (opcode)  => 0x1f6
+ *   fw/api/debug.h:539      DEBUG_TOKEN_CONFIG_TYPE = 0x2B
+ *   fw/api/debug.h:542-543  IWL_FW_DBG_CONFIG_TOKEN = 0x00010001
+ *                           ("this token disables debug asserts in the firmware")
+ *   fw/api/debug.h:549-552  struct iwl_fw_dbg_config_cmd { __le32 type; __le32 conf; }
+ *   fw/dbg.c:2459-2481      iwl_fw_disable_dbg_asserts(): flags 0 (sync), len 8, version 0
+ *   mld/fw.c:452            the call site: FIRST statement of iwl_mld_config_fw(),
+ *                           i.e. on EVERY start including every post-death reload
+ * The image we load advertises the command in its own TLV 48 (CMD_VERSIONS):
+ *   {cmd=0xf6, group=0x1, cmd_ver=9, notif_ver=0}.
+ * The payload is written below the port's own 0re/0gj gates at the use site.
+ * ======================================================================================== */
+#define IWX_LDBG_CONFIG_CMD        0xf6
+#define IWX_DEBUG_TOKEN_CONFIG_TYPE    0x2B
+#define IWX_FW_DBG_CONFIG_TOKEN        0x00010001
+
 #define IWX_MCAST_FILTER_CMD    0xd0
 
 /* D3 commands/notifications */
@@ -2007,7 +2450,6 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_MAC_CONF_GROUP    0x3
 #define IWX_PHY_OPS_GROUP    0x4
 #define IWX_DATA_PATH_GROUP    0x5
-#define IWX_STA_HE_CTXT_CMD    0x7
 #define IWX_PROT_OFFLOAD_GROUP    0xb
 #define IWX_REGULATORY_AND_NVM_GROUP    0xc
 
@@ -2017,9 +2459,33 @@ struct iwx_tx_queue_cfg_rsp {
 #define IWX_SOC_CONFIGURATION_CMD    0x01
 #define IWX_INIT_EXTENDED_CFG_CMD    0x03
 #define IWX_FW_ERROR_RECOVERY_CMD    0x07
+#define IWX_SYSTEM_STATISTICS_CMD    0x0f
+#define IWX_SYSTEM_STATISTICS_END_NOTIF    0xfd
+
+/*
+ * ==== S103u (PORT): THE SYSTEM-STATISTICS OPCODES ====
+ * Upstream `if_iwxreg.h:2071-2072`; Linux `fw/api/commands.h:634,639`.  MEASURED before the edit:
+ * IWX_SYSTEM_STATISTICS_CMD and IWX_SYSTEM_STATISTICS_END_NOTIF occur 0 times in all four of this
+ * tree's sources -- the port inlined upstream's legacy sender and dropped the ladder that chooses
+ * between them (upstream `if_iwx.c:8211-8231`).  The group is IWX_SYSTEM_GROUP (0x2, header :2294);
+ * Linux `fw/api/commands.h:40` says the same, and `:46` says 0x6 is SCAN_GROUP -- which is why the
+ * previous round's `(06,0x0f)` row measured ABSENT and was the wrong row, not a missing command.
+ * =====================================================================================
+ */
 
 /* DATA_PATH group subcommand IDs */
 #define IWX_DQA_ENABLE_CMD    0x00
+/*
+ * SCD_QUEUE_CONFIG_CMD -- the version-3 form of the queue-allocation command, in the DATA_PATH group
+ * (fw/api/datapath.h:87, `SCD_QUEUE_CONFIG_CMD = 0x17`).  The port sent SCD_QUEUE_CFG (0x1d, group 1)
+ * at every dynamic queue allocation; the FIRMWARE'S OWN version table selects the form:
+ *     iwl_fw_lookup_cmd_ver(fw, WIDE_ID(DATA_PATH_GROUP, SCD_QUEUE_CONFIG_CMD), 0)
+ * (mld/mld.c:368-370) and iwl_txq_dyn_alloc() branches on it (pcie/gen1_2/tx-gen2.c:1059,1076,1093).
+ * THIS firmware advertises (group 0x05, cmd 0x17) cmd_ver = 3 -> WIDE_ID(0x5, 0x17) = 0x517.
+ * Absent from this header until S103k -- the S103e/0fx shape: the port owned the mechanism and spoke
+ * the old form of a command whose form the device's own table selects.
+ */
+#define IWX_SCD_QUEUE_CONFIG_CMD    0x17
 #define IWX_TLC_MNG_CONFIG_CMD    0x0f
 #define IWX_RX_NO_DATA_NOTIF    0xf5
 #define IWX_TLC_MNG_UPDATE_NOTIF 0xf7
@@ -2037,6 +2503,12 @@ struct iwx_tx_queue_cfg_rsp {
 struct iwx_dqa_enable_cmd {
     uint32_t cmd_queue;
 } __packed; /* DQA_CONTROL_CMD_API_S_VER_1 */
+
+/* S220: LDBG_CFG_CMD_API_S_VER_7 (Linux fw/api/debug.h:549-552).  Two LE32s, 8 bytes. */
+struct iwx_fw_dbg_config_cmd {
+    uint32_t type;   /* DEBUG_TOKEN_CONFIG_TYPE = 0x2B */
+    uint32_t conf;   /* IWL_FW_DBG_CONFIG_TOKEN = 0x00010001 */
+} __packed; /* LDBG_CFG_CMD_API_S_VER_7 */
 
 struct iwx_sku_id {
     uint32_t data[3];
@@ -2279,6 +2751,10 @@ struct iwx_nvm_get_info_phy {
 
 #define IWX_NUM_CHANNELS_V1    51
 #define IWX_NUM_CHANNELS    110
+/* ==== S103e: the v5 channel count, mirroring the reference's IWL_NUM_CHANNELS_V3
+ * (fw/api/nvm-reg.h:208) and hence the 488-byte REGULATORY_NVM_GET_INFO_RSP_API_S_VER_5
+ * that this firmware actually sends (measured on S103d: payload=488, expected=476). == */
+#define IWX_NUM_CHANNELS_V3    115
 
 /**
  * struct iwx_nvm_get_info_regulatory - regulatory information
@@ -2331,6 +2807,23 @@ struct iwx_nvm_get_info_rsp {
     struct iwx_nvm_get_info_phy phy_sku;
     struct iwx_nvm_get_info_regulatory regulatory;
 } __packed; /* REGULATORY_NVM_GET_INFO_RSP_API_S_VER_4 */
+
+/* ==== S103e: the v5 shapes (REGULATORY_NVM_GET_INFO_REGULATORY_S_VER_3 and
+ * REGULATORY_NVM_GET_INFO_RSP_API_S_VER_5), mirroring the reference's
+ * iwl_nvm_get_info_regulatory / iwl_nvm_get_info_rsp (fw/api/nvm-reg.h:246-260).
+ * Same u32 field order as the v4 shape, with the 115-entry channel array. ====== */
+struct iwx_nvm_get_info_regulatory_v3 {
+    uint32_t lar_enabled;
+    uint32_t n_channels;
+    uint32_t channel_profile[IWX_NUM_CHANNELS_V3];
+} __packed; /* REGULATORY_NVM_GET_INFO_REGULATORY_S_VER_3 */
+
+struct iwx_nvm_get_info_rsp_v5 {
+    struct iwx_nvm_get_info_general general;
+    struct iwx_nvm_get_info_sku mac_sku;
+    struct iwx_nvm_get_info_phy phy_sku;
+    struct iwx_nvm_get_info_regulatory_v3 regulatory;
+} __packed; /* REGULATORY_NVM_GET_INFO_RSP_API_S_VER_5 */
 
 
 #define IWX_ALIVE_STATUS_ERR 0xDEAD
@@ -2949,34 +3442,6 @@ struct iwx_fw_cmd_version {
     uint8_t notif_ver;
 } __packed;
 
-/* HE station context ABI, Intel iwlwifi fw/api/mac.h (Linux v5.15,
- * dual BSD-3-Clause/GPL-2.0). Firmware 68 advertises command version 2. */
-struct iwx_he_backoff_conf {
-    uint16_t cwmin, cwmax, aifsn, mu_time;
-} __packed;
-struct iwx_he_sta_context_cmd {
-    uint8_t sta_id, tid_limit, reserved1, reserved2;
-    uint32_t flags;
-    uint8_t ref_bssid_addr[6];
-    uint16_t reserved0;
-    uint32_t htc_flags;
-    uint8_t frag_flags, frag_level, frag_max_num, frag_min_size;
-    uint8_t pkt_ext[2][4][2]; /* NSS, RU size, PPET8/PPET16 */
-    uint8_t bss_color, htc_trig_based_pkt_ext;
-    uint16_t frame_time_rts_th;
-    uint8_t rand_alloc_ecwmin, rand_alloc_ecwmax;
-    uint16_t reserved3;
-    struct iwx_he_backoff_conf trig_based_txf[4];
-    uint8_t max_bssid_indicator, bssid_index, ema_ap, profile_periodicity;
-    uint8_t bssid_count, reserved4[3];
-} __packed;
-#define IWX_HE_BSS_COLOR_DIS       (1U << 5)
-#define IWX_HE_PARTIAL_BSS_COLOR   (1U << 6)
-#define IWX_HE_32BIT_BA_BITMAP     (1U << 7)
-#define IWX_HE_PACKET_EXT          (1U << 8)
-#define IWX_HE_ACK_ENABLED         (1U << 11)
-#define IWX_HE_MU_EDCA_CW          (1U << 12)
-#define IWX_HE_NIC_NOT_ACK_ENABLED (1U << 13)
 /* Common PHY, MAC and Bindings definitions */
 
 #define IWX_MAX_MACS_IN_BINDING    (3)
@@ -3215,7 +3680,82 @@ struct iwx_time_event_notif {
 } __packed; /* IWX_MAC_TIME_EVENT_NTFY_API_S_VER_1 */
 
 #define IWX_SESSION_PROTECTION_CMD      0x5
+/*
+ * ==== SUP-P05 (offline triage, STRUCT/MECHANISM fix): THE MLD MAC-CONFIG COMMAND ====
+ * This is a `0gk`-class wall that the comparison did not list, and it sits on the ASSOCIATE path
+ * directly in front of the EDCA fix (SUP-P02): the port's MAC context goes out through
+ * `iwx_mac_ctxt_cmd()`, which sends `IWX_MAC_CONTEXT_CMD` (= 0x28, header :2184) on group 0 --
+ * rewritten by `iwx_send_cmd()` to `IWX_WIDE_ID(IWX_LONG_GROUP, 0x28)` = *** 01.28 ***.
+ *
+ * THE FIRMWARE'S OWN TABLE DOES NOT ADVERTISE 01.28.  It advertises the MLD form:
+ *     07-scripts/sup-tlv48.py over 01-fork/itlwm/firmware/iwlwifi-bz-b0-fm-c0-c106.ucode:
+ *         MAC_CONTEXT (01.28) cmd_ver = ABSENT
+ *         MAC_CONFIG  (03.08) cmd_ver = 4
+ * and BOTH references send 03.08 on this silicon class:
+ *     upstream `if_iwx.c:8077-8078`  if (sc->sc_use_mld_api) return iwx_mld_mac_ctxt_cmd(...);
+ *     upstream `if_iwx.c:8151-8153`  iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_MAC_CONF_GROUP,
+ *                                        IWX_MAC_CONFIG_CMD), 0, sizeof(cmd), &cmd);
+ *     Linux    `mld/iface.c:83`      u16 cmd_id = WIDE_ID(MAC_CONF_GROUP, MAC_CONFIG_CMD);
+ *     Linux    `mld/nan.c:27`        iwl_fw_lookup_cmd_ver(fw, WIDE_ID(MAC_CONF_GROUP,
+ *                                        MAC_CONFIG_CMD), 0) >= 4      <-- the SAME version 4
+ * This is the shape of walls 1, 2 and 4 (`01.18`, `01.1d` and the legacy scan request: absent
+ * from the table, never answered).  It is NOT claimed here that 01.28 is unserved -- only that
+ * the port never sends the form the table names, and that the reference does.
+ *
+ * NOTHING IN THIS PATCH IS BOOTED.  The legacy `01.28` body stays byte-identical and reachable
+ * for every image whose selector is 0.
+ * ===================================================================================
+ */
+#define IWX_MAC_CONFIG_CMD              0x8
 #define IWX_SESSION_PROTECTION_NOTIF    0xFB
+
+/*
+ * AUX_STA_CMD -- the MAC_CONF_GROUP (0x3) subcommand the reference's MLD op mode sends for the aux
+ * station, in place of the legacy LONG_GROUP IWX_ADD_STA (0x18).  fw/api/mac-cfg.h:54
+ * (`AUX_STA_CMD = 0xB`); the reference's only sender is mld/sta.c iwl_mld_send_aux_sta_cmd() (and its
+ * mvm-mld twin mvm/mld-sta.c:96).  ABSENT FROM THIS HEADER UNTIL S103j -- and its absence is the
+ * defect this round names: the port owned the mechanism (IWX_MAC_CONF_GROUP) and did not use the
+ * op mode's command.
+ */
+#define IWX_AUX_STA_CMD        0xB
+
+/*
+ * ==== S103t (PORT): THE MLD ADD/REMOVE SET'S OPCODES AND ITS TWO LINK-CONTEXT ENUMS ====
+ * Upstream `if_iwxreg.h:2077-2079` (the three MAC_CONF_GROUP opcodes the trio and the MLD remove
+ * use) and the two enums `iwx_mld_modify_link_fill()` needs (`:4988-4996` modify flags,
+ * `:5007-5012` protection flags).  The port already owned IWX_MAC_CONF_GROUP (header :2295) and did
+ * not own the opcodes -- MEASURED before the edit: IWX_LINK_CONFIG_CMD, IWX_STA_CONFIG_CMD and
+ * IWX_STA_REMOVE_CMD occur 0 times in all four of this tree's sources (the S103e/S103j shape).
+ * The Bz EDCA->FIFO map is likewise absent (`enum iwx_bz_tx_fifo`, upstream `:1855-1864`).
+ * =====================================================================================
+ */
+#define IWX_LINK_CONFIG_CMD    0x09
+#define IWX_STA_CONFIG_CMD    0x0a
+#define IWX_STA_REMOVE_CMD    0x0c
+
+enum iwx_bz_tx_fifo {
+    IWX_BZ_EDCA_TX_FIFO_BK,
+    IWX_BZ_EDCA_TX_FIFO_BE,
+    IWX_BZ_EDCA_TX_FIFO_VI,
+    IWX_BZ_EDCA_TX_FIFO_VO,
+    IWX_BZ_TRIG_TX_FIFO_BK,
+    IWX_BZ_TRIG_TX_FIFO_BE,
+    IWX_BZ_TRIG_TX_FIFO_VI,
+    IWX_BZ_TRIG_TX_FIFO_VO,
+};
+
+/* upstream if_iwxreg.h:4988-4996 -- `enum iwx_link_ctx_modify_flags` */
+#define IWX_LINK_CONTEXT_MODIFY_ACTIVE        (1 << 0)
+#define IWX_LINK_CONTEXT_MODIFY_RATES_INFO    (1 << 1)
+#define IWX_LINK_CONTEXT_MODIFY_PROTECT_FLAGS (1 << 2)
+#define IWX_LINK_CONTEXT_MODIFY_QOS_PARAMS    (1 << 3)
+#define IWX_LINK_CONTEXT_MODIFY_BEACON_TIMING (1 << 4)
+
+/* upstream if_iwxreg.h:5007-5012 -- `enum iwx_link_ctx_protection_flags` */
+#define IWX_LINK_PROT_FLG_TGG_PROTECT    (1 << 0)
+#define IWX_LINK_PROT_FLG_HT_PROT        (1 << 1)
+#define IWX_LINK_PROT_FLG_FAT_PROT       (1 << 2)
+
 
 #define IWX_SESSION_PROTECT_CONF_ASSOC  0
 #define IWX_SESSION_PROTECT_CONF_GO_CLIENT_ASSOC    1
@@ -3350,6 +3890,14 @@ struct iwx_time_quota_cmd {
 #define IWX_PHY_VHT_CTRL_POS_4_ABOVE  (0x7)
 
 /*
+ * S103l: the control-channel-position bit the reference's own PHY-context sender XORs into
+ * secondary_ctrl_chnl_loc when no NPCA channel is used (mld/phy.c:167-168, `fw/api/phy-ctxt.h:37`
+ * IWL_PHY_CTRL_POS_ABOVE = 0x4).  Same encoding as the IWX_PHY_VHT_CTRL_POS_* values above
+ * (0b0100 = "above", bits 0-1 = the offset, bit 3 = _OFFS_EXT).
+ */
+#define IWX_PHY_CTRL_POS_ABOVE        0x4
+
+/*
  * @band: IWX_PHY_BAND_*
  * @channel: channel number
  * @width: PHY_[VHT|LEGACY]_CHANNEL_*
@@ -3463,11 +4011,23 @@ struct iwx_phy_context_cmd_v1 {
  * ( PHY_CONTEXT_CMD = 0x8 )
  * @id_and_color: ID and color of the relevant Binding
  * @action: action to perform, one of FW_CTXT_ACTION_*
- * @lmac_id: the lmac id the phy context belongs to
  * @ci: channel info
- * @rxchain_info: ???
+ * @lmac_id: the lmac id the phy context belongs to
+ * @rxchain_info: (PHY_CONTEXT_CMD_API_VER_3/_VER_4 only) reserved from _VER_4 onwards
+ * @sbb_bandwidth: (PHY_CONTEXT_CMD_API_VER_5/_VER_6) 0 disabled, 1 - 40MHz ... 4 - 320MHz
+ * @sbb_ctrl_channel_loc: (PHY_CONTEXT_CMD_API_VER_5/_VER_6) location of the control channel
+ * @puncture_mask: (PHY_CONTEXT_CMD_API_VER_6) bitmap of punctured subchannels
  * @dsp_cfg_flags: set to 0
+ * @secondary_ctrl_chnl_loc: (from PHY_CONTEXT_CMD_API_VER_6) location of secondary control channel
  * @reserved: reserved to align to 64 bit
+ *
+ * S103l: ONE struct for EVERY version the firmware declares, exactly as the reference declares it
+ * (`fw/api/phy-ctxt.h:152-170`, PHY_CONTEXT_CMD_API_VER_3 ... _VER_7).  The union is the API-version
+ * boundary the port could not express before: for _VER_3/_VER_4 the field is `rxchain_info`, for
+ * _VER_5/_VER_6 it is `sbb_bandwidth`/`sbb_ctrl_channel_loc`/`puncture_mask`.  THIS firmware's TLV-48
+ * says (0x01,0x08) cmd_ver = 6, so the second form is the one it is told to expect; the union member
+ * names are the reference's, not invented.  The packed size is UNCHANGED (32 bytes) -- asserted by the
+ * size gate below, and the tail's `reserved` becomes what _VER_6 calls it.
  */
 struct iwx_phy_context_cmd {
     /* COMMON_INDEX_HDR_API_S_VER_1 */
@@ -3476,10 +4036,28 @@ struct iwx_phy_context_cmd {
     /* PHY_CONTEXT_DATA_API_S_VER_3 */
     struct iwx_fw_channel_info ci;
     uint32_t lmac_id;
-    uint32_t rxchain_info;
+    union {
+        uint32_t rxchain_info;    /* PHY_CONTEXT_CMD_API_VER_3/_VER_4 */
+        struct {                  /* PHY_CONTEXT_CMD_API_VER_5/_VER_6 */
+            uint8_t sbb_bandwidth;
+            uint8_t sbb_ctrl_channel_loc;
+            uint16_t puncture_mask;    /* added in PHY_CONTEXT_CMD_API_VER_6 */
+        };
+    };
     uint32_t dsp_cfg_flags;
-    uint32_t reserved;
-} __packed; /* PHY_CONTEXT_CMD_API_VER_3 */
+    uint8_t secondary_ctrl_chnl_loc;
+    uint8_t reserved[3];
+} __packed; /* PHY_CONTEXT_CMD_API_VER_3, PHY_CONTEXT_CMD_API_VER_4,
+             * PHY_CONTEXT_CMD_API_VER_5, PHY_CONTEXT_CMD_API_VER_6,
+             * PHY_CONTEXT_CMD_API_S_VER_7 */
+
+/*
+ * S103l SIZE GATE (compile-gated, so `the form is 32 bytes` is a CHECK and not a claim -- 0gj):
+ * 4 + 4 + 8 (ci) + 4 (lmac_id) + 4 (union) + 4 (dsp_cfg_flags) + 1 + 3 = 32.  `__packed` is
+ * `__attribute__((packed)) __attribute__((aligned(1)))`, so there is no padding to lose.
+ */
+typedef char iwx_phy_context_cmd_must_be_32_bytes[
+    (sizeof(struct iwx_phy_context_cmd) == 32) ? 1 : -1];
 
 
 #define IWX_RX_INFO_PHY_CNT 8
@@ -4439,6 +5017,52 @@ struct iwx_statistics_cmd {
     uint32_t flags;
 } __packed; /* STATISTICS_CMD_API_S_VER_1 */
 
+/*
+ * ==== S103u (PORT): THE SYSTEM-STATISTICS PAYLOAD AND ITS RECEIPT ====
+ * Upstream `if_iwxreg.h:4224-4264` (the two enums and `struct iwx_system_statistics_cmd`) and
+ * `:4445-4451` (`struct iwx_system_statistics_end_notif`).  Linux `fw/api/stats.h:418-456, 707-713`
+ * -- and the two references AGREE value for value: ON_DEMAND = BIT(1) = 2, OPER = BIT(0),
+ * OPER_PART1 = BIT(1), 12 bytes packed, STATISTICS_FW_CMD_API_S_VER_1.
+ * The RECEIPT struct is not decoration: upstream's rx case `if_iwx.c:11352-11359` is the ONLY thing
+ * that sets sc_system_stats_cleared, and the wide sender BLOCKS on it (`:8201-8206`).
+ * =====================================================================================
+ */
+enum iwx_statistics_cfg_flags {
+    IWX_STATS_CFG_FLG_DISABLE_NTFY_MSK    = (1 << 0),
+    IWX_STATS_CFG_FLG_ON_DEMAND_NTFY_MSK    = (1 << 1),
+    IWX_STATS_CFG_FLG_RESET_MSK        = (1 << 2),
+};
+
+enum iwx_statistics_notify_type_id {
+    IWX_STATS_NTFY_TYPE_ID_OPER        = (1 << 0),
+    IWX_STATS_NTFY_TYPE_ID_OPER_PART1    = (1 << 1),
+    IWX_STATS_NTFY_TYPE_ID_OPER_PART2    = (1 << 2),
+    IWX_STATS_NTFY_TYPE_ID_OPER_PART3    = (1 << 3),
+    IWX_STATS_NTFY_TYPE_ID_OPER_PART4    = (1 << 4),
+};
+
+struct iwx_system_statistics_cmd {
+    uint32_t cfg_mask;
+    uint32_t config_time_sec;
+    uint32_t type_id_mask;
+} __packed; /* STATISTICS_FW_CMD_API_S_VER_1 */
+
+struct iwx_system_statistics_end_notif {
+    uint32_t time_stamp;
+} __packed; /* STATISTICS_FW_NTFY_END_API_S_VER_1 */
+
+/*
+ * S103u COMPILE GATES.  These are the members whose SIZE and VALUE are the round's wire contract,
+ * so they are asserted by the compiler rather than by a comment.  Their operands (the structs, the
+ * enums) are all visible HERE, above the point of use -- the S103t AMENDMENT-2 lesson, applied
+ * rather than re-learned.  The gate that needs IWX_WIDE_ID (defined at header :8054, BELOW this
+ * point) is in the .cpp, where both operands are visible.
+ */
+typedef char iwx_s103u_sys_stats_cmd_is_12[(sizeof(struct iwx_system_statistics_cmd) == 12) ? 1 : -1];
+typedef char iwx_s103u_end_notif_is_4[(sizeof(struct iwx_system_statistics_end_notif) == 4) ? 1 : -1];
+typedef char iwx_s103u_on_demand_is_2[(IWX_STATS_CFG_FLG_ON_DEMAND_NTFY_MSK == 2) ? 1 : -1];
+typedef char iwx_s103u_type_mask_is_3[((IWX_STATS_NTFY_TYPE_ID_OPER | IWX_STATS_NTFY_TYPE_ID_OPER_PART1) == 3) ? 1 : -1];
+
 
 /***********************************
  * Smart Fifo API
@@ -4712,6 +5336,181 @@ struct iwx_mac_data_p2p_dev {
 
 #define IWX_MAC_FILTER_IN_11AX          (1 << 14)
 
+/*
+ * ==== SUP-P05 (part 2): the MLD MAC-config command's OWN vocabulary ====
+ * Upstream's `enum iwx_mac_config_filter_flags` (`if_iwxreg.h:4882-4889`) and
+ * `struct iwx_mac_config_cmd` (`:4910-4928`) with its client payload (`:4845-4855`).  The port
+ * has NONE of these (`IWX_MAC_CFG_FILTER_` = 0 hits; `iwx_mac_client_data` = 0 hits).  Note the
+ * MLD filter flag set is NOT the legacy `IWX_MAC_FILTER_*` set above -- the low bits coincide
+ * (PROMISC 1<<0, CONTROL_AND_MGMT 1<<1, ACCEPT_GRP 1<<2) but BEACON is 1<<3 here against the
+ * legacy 1<<6, and PROBE_REQ is 1<<5 against the legacy 1<<12.  Reusing the legacy names here
+ * would be a silent value substitution, so the reference's own names are added instead.
+ * ===================================================================
+ */
+enum iwx_mac_config_filter_flags {
+    IWX_MAC_CFG_FILTER_PROMISC              = (1 << 0),
+    IWX_MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT  = (1 << 1),
+    IWX_MAC_CFG_FILTER_ACCEPT_GRP           = (1 << 2),
+    IWX_MAC_CFG_FILTER_ACCEPT_BEACON        = (1 << 3),
+    IWX_MAC_CFG_FILTER_ACCEPT_BCAST_PROBE_RESP  = (1 << 4),
+    IWX_MAC_CFG_FILTER_ACCEPT_PROBE_REQ     = (1 << 5),
+};
+
+/* MAC_CONTEXT_CONFIG_CLIENT_DATA_API_S_VER_2 (mac-cfg.h:299-309) -- unchanged. */
+struct iwx_mac_client_data {
+    uint8_t is_assoc;
+    uint8_t esr_transition_timeout;
+    uint16_t medium_sync_delay;
+    uint16_t assoc_id;
+    uint16_t reserved1;
+    uint16_t data_policy;
+    uint16_t reserved2;
+    uint32_t ctwin;
+} __packed;
+
+/* MAC_CONTEXT_CONFIG_P2P_DEV_DATA_API_S_VER_1 (mac-cfg.h:321-323). */
+struct iwx_mac_p2p_dev_data {
+    uint32_t is_disc_extended;
+} __packed;
+
+/*
+ * ==== S103r R1: `MAC_CONTEXT_CONFIG_NAN_DATA_API_S_VER_1` -- THE MEMBER THE v4 API ADDS ====
+ * `fw/api/mac-cfg.h:426-431`.  It is 20 bytes, it is a member of `iwl_mac_config_cmd`'s last union
+ * ONLY from `_API_S_VER_4` (`:452-477`), and it is the LARGER of that union's members
+ * (client 16, p2p_dev 4) -- so its absence is what made `sup-p05`'s payload 4 bytes short.
+ * ==========================================================================================
+ */
+struct iwx_mac_nan_data {
+    struct {
+        uint8_t addr[6];
+        uint16_t reserved;
+    } __packed ndi_addrs[2];
+    uint32_t ndi_addrs_count;
+} __packed;
+
+/*
+ * ==== S103r R1: THE TWO SPELLINGS OF THE SAME 8 BYTES (`mac-cfg.h:353-357`, `:370-376`) ====
+ * `wifi_gen_v2` is the version-2 spelling; `wifi_gen` is the version-3-and-later spelling, which
+ * adds `uhr_support` and moves `he_ap_support` from byte 26 to byte 25.  They are byte-identical
+ * while every field is zero (which is this path's value for all four -- see the scope call (S103r)
+ * section 2), but they DISAGREE the moment `he_ap_support` is set, so the reference's own union of
+ * the two is mirrored rather than one spelling being chosen by taste.
+ * ==========================================================================================
+ */
+struct iwx_mac_wifi_gen_support_v2 {
+    uint16_t he_support;
+    uint16_t he_ap_support;
+    uint32_t eht_support;
+} __packed;
+
+struct iwx_mac_wifi_gen_support {
+    uint8_t he_support;
+    uint8_t he_ap_support;
+    uint8_t eht_support;
+    uint8_t uhr_support;
+    uint32_t reserved;
+} __packed;
+
+/*
+ * ==== S103r R1 (THE VARIABLE, MEMBER M1): `MAC_CONTEXT_CONFIG_CMD_API_S_VER_4` ====
+ * `fw/api/mac-cfg.h:452-477`, mirrored field for field including both unions.  THE DEFECT THIS
+ * REPLACES, in `sup-p05`'s own words: *"the union's p2p_dev member is omitted ... it is the LARGER
+ * of the two, so the size below is the reference's too."*  **True for `_API_S_VER_2`, false for
+ * `_API_S_VER_4`**: in v4 a THIRD member appears -- `struct iwx_mac_nan_data`, 20 bytes -- so the
+ * union is 20, the command is 56, and the port was sending 52 to a command this firmware advertises
+ * as version 4.
+ *
+ * MEASURED (compiled from the reference's own definitions, `07-scripts/s103r-structsizes.c`):
+ *     client=16 p2p=4 nan=20 wifi_gen=8 wifi_gen_v2=8 | v3=52 v4=56 (delta 4)
+ *     offsetof(nan.ndi_addrs_count) in v4 = 52      <- the four bytes that were not sent
+ *
+ * THE REFERENCE'S LENGTH SELECTION (`mld/iface.c:81,89-93`):
+ *     int len = sizeof(*cmd);
+ *     if (iwl_fw_lookup_cmd_ver(mld->fw, cmd_id, 0) < 4) { ... len = sizeof(v3); }
+ * and this device's own TLV-48 row is `(03,08) cmd_ver = 4` -> the first branch -> 56 bytes.
+ * The mvm-shaped MLD implementation cannot run here at all (`mvm/mld-mac.c:37`
+ * `if (WARN_ON(cmd_ver > 3)) return;`), so the ONLY Linux implementation that runs on this device
+ * sends 56.
+ * ==========================================================================================
+ */
+struct iwx_mac_config_cmd {
+    uint32_t id_and_color;
+    uint32_t action;
+    uint32_t mac_type;
+    uint8_t local_mld_addr[6];
+    uint16_t reserved_for_local_mld_addr;
+    uint32_t filter_flags;
+    union {
+        struct iwx_mac_wifi_gen_support_v2 wifi_gen_v2;
+        struct iwx_mac_wifi_gen_support wifi_gen;
+    };
+    uint32_t nic_not_ack_enabled;
+    union {
+        struct iwx_mac_client_data client;
+        struct iwx_mac_p2p_dev_data p2p_dev;
+        struct iwx_mac_nan_data nan;
+    };
+} __packed; /* MAC_CONTEXT_CONFIG_CMD_API_S_VER_4 */
+
+/*
+ * ==== S103r R1 GATES (0gj): DERIVED, NOT TYPED, AND EACH SHOWN ABLE TO FAIL ====
+ * Every number below is the *result* of the reference's own definitions rather than a value chosen
+ * here, and `s103r-adapt.py` builds three NEGATIVE CONTROL translation units that must FAIL TO
+ * COMPILE, each naming the gate it breaks (G9).  A gate whose failing case has never been compiled
+ * is a sentence, not a gate.
+ * ==============================================================================
+ */
+typedef char iwx_mac_config_cmd_must_be_56_bytes[
+    (sizeof(struct iwx_mac_config_cmd) == 56) ? 1 : -1];
+typedef char iwx_mac_client_data_must_be_16_bytes[
+    (sizeof(struct iwx_mac_client_data) == 16) ? 1 : -1];
+typedef char iwx_mac_nan_data_must_be_20_bytes[
+    (sizeof(struct iwx_mac_nan_data) == 20) ? 1 : -1];
+typedef char iwx_mac_config_nan_minus_client_is_the_v4_delta[
+    ((sizeof(struct iwx_mac_nan_data) - sizeof(struct iwx_mac_client_data)) == 4) ? 1 : -1];
+typedef char iwx_mac_config_wifi_gen_spellings_are_8_bytes[
+    ((sizeof(struct iwx_mac_wifi_gen_support) == 8) &&
+     (sizeof(struct iwx_mac_wifi_gen_support_v2) == 8)) ? 1 : -1];
+
+/*
+ * ==== S103r R2 GATE (0gj): MEMBER M2 IS CHECKABLE ARITHMETIC, NOT A LITERAL ====
+ * `IWX_MLD_NIC_NOT_ACK_ENABLED` is not a hand-typed 1: it is the reference's own computation,
+ * `!iwl_mld_is_nic_ack_enabled()`, over the reference's own HE capability bytes.
+ *   `iwl_mld_is_nic_ack_enabled()`  mld/iface.c:124-140  -> mac_cap_info[2] & ACK_EN
+ *   `iwl_iftype_cap[]` STATION entry  iwl-nvm-parse.c:560 -> mac_cap_info[2] = 32BIT_BA_BITMAP
+ *   `IEEE80211_HE_MAC_CAP2_32BIT_BA_BITMAP`  ieee80211-he.h:247 = 0x20
+ *   `IEEE80211_HE_MAC_CAP2_ACK_EN`           ieee80211-he.h:249 = 0x80
+ * `mac_cap_info[2]` is written in exactly ONE place in the whole reference, and it is that line --
+ * so the result does not depend on which iftype is selected, and it is 1 when `own_he_cap` is NULL
+ * as well (`&&` short-circuits to false).
+ * ==============================================================================
+ */
+#define IWX_MLD_HE_MAC_CAP2_32BIT_BA_BITMAP 0x20
+#define IWX_MLD_HE_MAC_CAP2_ACK_EN          0x80
+#define IWX_MLD_OWN_HE_MAC_CAP_INFO_2       IWX_MLD_HE_MAC_CAP2_32BIT_BA_BITMAP
+#define IWX_MLD_NIC_ACK_ENABLED \
+    (!!(IWX_MLD_OWN_HE_MAC_CAP_INFO_2 & IWX_MLD_HE_MAC_CAP2_ACK_EN))
+#define IWX_MLD_NIC_NOT_ACK_ENABLED (!IWX_MLD_NIC_ACK_ENABLED)
+typedef char iwx_mld_nic_not_ack_enabled_is_1[
+    (IWX_MLD_NIC_NOT_ACK_ENABLED == 1) ? 1 : -1];
+typedef char iwx_mld_ack_en_bit_is_clear_in_the_drivers_own_caps[
+    ((IWX_MLD_OWN_HE_MAC_CAP_INFO_2 & IWX_MLD_HE_MAC_CAP2_ACK_EN) == 0) ? 1 : -1];
+
+/*
+ * ==== S103q GATE (0gj): THE ONE NON-VERBATIM SUBSTITUTION IN THE MLD SENDER IS A CHECK ====
+ * Upstream's MLD monitor branch (`if_iwx.c:8133`) writes the LEGACY name
+ * `IWX_MAC_FILTER_IN_CONTROL_AND_MGMT` inside an expression otherwise built from the MLD enum;
+ * the translation writes `IWX_MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT`.  MEASURED: the port's
+ * legacy value is (1 << 1) and the MLD value is (1 << 1), so the substitution is a NAMING
+ * normalisation and not a value change -- and this typedef makes that a compile-time CHECK.
+ * (The branch is IEEE80211_M_MONITOR; this port runs STA, so the boot cannot be its instrument.
+ * The compiler can.)
+ * =========================================================================================
+ */
+typedef char iwx_mld_filter_substitution_is_value_identical[
+    (IWX_MAC_CFG_FILTER_ACCEPT_CONTROL_AND_MGMT ==
+     IWX_MAC_FILTER_IN_CONTROL_AND_MGMT) ? 1 : -1];
+
 /**
  * QoS flags
  * @IWX_MAC_QOS_FLG_UPDATE_EDCA: ?
@@ -4748,6 +5547,199 @@ struct iwx_ac_qos {
     uint8_t fifos_mask;
     uint16_t edca_txop;
 } __packed; /* IWX_AC_QOS_API_S_VER_2 */
+
+/*
+ * ==== S103t (PORT + ONE DECLARED ADAPT): THE SIX STRUCTS THE MLD ADD/REMOVE SET PUTS ON THE WIRE ====
+ *
+ * `struct iwx_he_backoff_conf` and `struct iwx_he_pkt_ext_v2`   upstream `if_iwxreg.h:5156`, `:5193`
+ * `struct iwx_link_config_cmd` (208 B, `03.09`)                 upstream `if_iwxreg.h:5066`
+ * `struct iwx_mvm_sta_cfg_cmd` (96 B, the v1 arm)               upstream `if_iwxreg.h:5193`
+ * `struct iwx_sta_cfg_cmd_v2`  (104 B, the `cmd_ver == 2` arm)  upstream `if_iwxreg.h:5257`
+ * `struct iwx_sta_cfg_cmd_v3`  (112 B, `STA_CMD_API_S_VER_3`)   **ADAPT**: Linux `fw/api/mac-cfg.h:952`
+ *
+ * WHY THE v3 STRUCT IS AN ADAPT AND NOT A PORT, MEASURED: this image advertises `(03,0a) cmd_ver 3`
+ * (TLV-48, `07-scripts/s103t-tlv.py`).  Upstream's ladder has arms for 2, 1 and
+ * IWX_FW_CMD_VER_UNKNOWN ONLY, and `cmd_ver == 3` falls to `default: return ENOTSUP;` BEFORE ANY SEND.
+ * The reference that implements ver 3 is Linux: `iwl_mld_send_sta_cmd()` (`mld/sta.c:403-429`) sends
+ * `sizeof(struct iwl_sta_cfg_cmd)` for every `cmd_ver >= 3`, and writes `link_mask` where the v2 form
+ * has `link_id` (`mld/sta.c:497,503`: `link_mask = BIT(mld_link->fw_id)`), with its own validator
+ * requiring `hweight32(link_mask) == 1` for a non-NAN station (`:439`).  OpenBSD has neither the
+ * struct nor the arm.
+ *
+ * THE LINK COMMAND NEEDS NO ADAPT, AND THAT IS ALSO MEASURED: Linux's `iwl_mld_send_link_cmd()`
+ * (`mld/link.c:38-55`) never consults a version -- it sends `sizeof(*cmd)` and its struct is tagged
+ * `LINK_CONTEXT_CONFIG_CMD_API_S_VER_1 ... _VER_8` (`fw/api/mac-cfg.h:682-731`, the
+ * union-of-versions superset).  `sizeof(iwx_link_config_cmd) == sizeof(iwl_link_config_cmd) == 208`,
+ * delta 0, and 22/22 shared field offsets equal (`07-scripts/s103t-linkcfg.c`).
+ * ================================================================================================
+ */
+#define MAX_HE_SUPP_NSS 2
+#define MAX_CHANNEL_BW_INDX_API_D_VER_3 5
+
+struct iwx_he_backoff_conf {
+    uint16_t cwmin;
+    uint16_t cwmax;
+    uint16_t aifsn;
+    uint16_t mu_time;
+} __packed; /* AC_QOS_DOT11AX_API_S */
+
+struct iwx_he_pkt_ext_v2 {
+    uint8_t pkt_ext_qam_th[MAX_HE_SUPP_NSS][MAX_CHANNEL_BW_INDX_API_D_VER_3][2];
+} __packed; /* PKT_EXT_DOT11AX_API_S_VER_2 */
+
+struct iwx_link_config_cmd {
+    uint32_t action;
+    uint32_t link_id;
+    uint32_t mac_id;
+    uint32_t phy_id;
+    uint8_t local_link_addr[6];
+    uint16_t reserved_for_local_link_addr;
+    uint32_t modify_mask;
+    uint32_t active;
+    uint32_t listen_lmac;
+    uint32_t cck_rates;
+    uint32_t ofdm_rates;
+    uint32_t cck_short_preamble;
+    uint32_t short_slot;
+    uint32_t protection_flags;
+    uint32_t qos_flags;
+    struct iwx_ac_qos ac[IWX_AC_NUM + 1];
+    uint8_t htc_trig_based_pkt_ext;
+    uint8_t rand_alloc_ecwmin;
+    uint8_t rand_alloc_ecwmax;
+    uint8_t ndp_fdbk_buff_th_exp;
+    struct iwx_he_backoff_conf trig_based_txf[IWX_AC_NUM];
+    uint32_t bi;
+    uint32_t dtim_interval;
+    uint16_t puncture_mask;
+    uint16_t frame_time_rts_th;
+    uint32_t flags;
+    uint32_t flags_mask;
+    uint8_t ref_bssid_addr[6];
+    uint16_t reserved_for_ref_bssid_addr;
+    uint8_t bssid_index;
+    uint8_t bss_color;
+    uint8_t spec_link_id;
+    uint8_t reserved;
+    uint8_t ibss_bssid_addr[6];
+    uint16_t reserved_for_ibss_bssid_addr;
+    uint32_t reserved1[8];
+} __packed; /* LINK_CONTEXT_CONFIG_CMD_API_S_VER_1 */
+
+struct iwx_mvm_sta_cfg_cmd {
+    uint32_t sta_id;
+    uint32_t link_id;
+    uint8_t peer_mld_address[6];
+    uint16_t reserved_for_peer_mld_address;
+    uint8_t peer_link_address[6];
+    uint16_t reserved_for_peer_link_address;
+    uint32_t station_type;
+    uint32_t assoc_id;
+    uint32_t beamform_flags;
+    uint32_t mfp;
+    uint32_t mimo;
+    uint32_t mimo_protection;
+    uint32_t ack_enabled;
+    uint32_t trig_rnd_alloc;
+    uint32_t tx_ampdu_spacing;
+    uint32_t tx_ampdu_max_size;
+    uint32_t sp_length;
+    uint32_t uapsd_acs;
+    struct iwx_he_pkt_ext_v2 pkt_ext;
+    uint32_t htc_flags;
+} __packed; /* STA_CMD_API_S_VER_1 */
+
+struct iwx_sta_cfg_cmd_v2 {
+    uint32_t sta_id;
+    uint32_t link_id;
+    uint8_t peer_mld_address[6];
+    uint16_t reserved_for_peer_mld_address;
+    uint8_t peer_link_address[6];
+    uint16_t reserved_for_peer_link_address;
+    uint32_t station_type;
+    uint32_t assoc_id;
+    uint32_t beamform_flags;
+    uint32_t mfp;
+    uint32_t mimo;
+    uint32_t mimo_protection;
+    uint32_t ack_enabled;
+    uint32_t trig_rnd_alloc;
+    uint32_t tx_ampdu_spacing;
+    uint32_t tx_ampdu_max_size;
+    uint32_t sp_length;
+    uint32_t uapsd_acs;
+    struct iwx_he_pkt_ext_v2 pkt_ext;
+    uint32_t htc_flags;
+    uint8_t use_ldpc_x2_cw;
+    uint8_t use_icf;
+    uint8_t dps_pad_time;
+    uint8_t dps_trans_delay;
+    uint8_t mic_prep_pad_delay;
+    uint8_t mic_compute_pad_delay;
+    uint8_t reserved[2];
+} __packed; /* STA_CMD_API_S_VER_2 */
+
+struct iwx_sta_cfg_cmd_v3 {
+    uint32_t sta_id;
+    uint32_t link_mask;
+    uint8_t peer_mld_address[6];
+    uint16_t reserved_for_peer_mld_address;
+    uint8_t peer_link_address[6];
+    uint16_t reserved_for_peer_link_address;
+    uint32_t station_type;
+    uint32_t assoc_id;
+    uint32_t beamform_flags;
+    uint32_t mfp;
+    uint32_t mimo;
+    uint32_t mimo_protection;
+    uint32_t ack_enabled;
+    uint32_t trig_rnd_alloc;
+    uint32_t tx_ampdu_spacing;
+    uint32_t tx_ampdu_max_size;
+    uint32_t sp_length;
+    uint32_t uapsd_acs;
+    struct iwx_he_pkt_ext_v2 pkt_ext;
+    uint32_t htc_flags;
+    uint8_t use_ldpc_x2_cw;
+    uint8_t use_icf;
+    uint8_t dps_pad_time;
+    uint8_t dps_trans_delay;
+    uint8_t dps_enabled;
+    uint8_t mic_prep_pad_delay;
+    uint8_t mic_compute_pad_delay;
+    uint8_t nmi_sta_id;
+    uint8_t ndi_local_addr[6];
+    uint8_t reserved[2];
+} __packed; /* STA_CMD_API_S_VER_3 */
+
+/*
+ * ==== S103t GATES (0gj): THE WIRE LENGTHS AND THE ONE ALIASING CLAIM, AS COMPILE-TIME ARITHMETIC ====
+ * Every number was MEASURED first (`07-scripts/s103t-structsizes.c`, host cc, the references' own
+ * definitions).  A transcription slip in any of the six structs above now FAILS THE BUILD.
+ * `offsetof(v3, link_mask) == offsetof(v2, link_id)` is the claim that lets ONE fill path write both
+ * versions: it is asserted here rather than assumed.  (The two forms also differ in the last 12 bytes
+ * -- `dps_enabled` lands where v2 has `mic_prep_pad_delay` -- and this round never writes any of
+ * those fields, so the wire bytes for every field it DOES write are identical in both forms.)
+ * ================================================================================================
+ */
+typedef char iwx_s103t_he_pkt_ext_v2_is_20[(sizeof(struct iwx_he_pkt_ext_v2) == 20) ? 1 : -1];
+typedef char iwx_s103t_link_config_is_208[(sizeof(struct iwx_link_config_cmd) == 208) ? 1 : -1];
+typedef char iwx_s103t_link_action_is_at_0[(__builtin_offsetof(struct iwx_link_config_cmd, action) == 0) ? 1 : -1];
+typedef char iwx_s103t_sta_v1_is_96[(sizeof(struct iwx_mvm_sta_cfg_cmd) == 96) ? 1 : -1];
+typedef char iwx_s103t_sta_v2_is_104[(sizeof(struct iwx_sta_cfg_cmd_v2) == 104) ? 1 : -1];
+typedef char iwx_s103t_sta_v3_is_112[(sizeof(struct iwx_sta_cfg_cmd_v3) == 112) ? 1 : -1];
+typedef char iwx_s103t_sta_v3_minus_v2_is_8[
+    ((sizeof(struct iwx_sta_cfg_cmd_v3) - sizeof(struct iwx_sta_cfg_cmd_v2)) == 8) ? 1 : -1];
+typedef char iwx_s103t_link_mask_is_where_link_id_was[
+    ((__builtin_offsetof(struct iwx_sta_cfg_cmd_v3, link_mask) ==
+      __builtin_offsetof(struct iwx_sta_cfg_cmd_v2, link_id)) &&
+     (__builtin_offsetof(struct iwx_sta_cfg_cmd_v3, link_mask) == 4)) ? 1 : -1];
+typedef char iwx_s103t_ac_num_is_4[(IWX_AC_NUM == 4) ? 1 : -1];
+/* AMENDMENT 2 (caught by the COMPILER, at zero boot cost): the two gates that need `struct
+ * iwx_rm_sta_cmd` (defined at if_iwxreg.h:8475, AFTER this block) and `IWX_STATION_ID` (declared in
+ * if_iwxvar.h, which this header does not include) live in ItlIwx.cpp instead, where both are
+ * visible.  They are NOT dropped -- the assumption they protect is the same. */
+
 
 /**
  * struct iwx_mac_ctx_cmd - command structure to configure MAC contexts
@@ -4869,6 +5861,10 @@ struct iwx_ltr_config_cmd {
  * @IWX_POWER_FLAGS_LPRX_ENA_MSK: Low Power RX enable.
  * @IWX_POWER_FLAGS_AP_UAPSD_MISBEHAVING_ENA_MSK: AP/GO's uAPSD misbehaving
  *        detection enablement
+ * @IWX_POWER_FLAGS_ENABLE_SMPS_MSK: SMPS is allowed for this vif.  DEFINED BY S103bf: the port
+ *        had NO name for BIT 14 (`grep -rn ENABLE_SMPS <tree>` -> 0 occurrences) while the driver
+ *        that works on this card sets it; the definition is copied verbatim in meaning from
+ *        `linux-ref-7.2.8/fw/api/power.h: POWER_FLAGS_ENABLE_SMPS_MSK = BIT(14)`.
 */
 #define IWX_POWER_FLAGS_POWER_SAVE_ENA_MSK        (1 << 0)
 #define IWX_POWER_FLAGS_POWER_MANAGEMENT_ENA_MSK    (1 << 1)
@@ -4878,6 +5874,7 @@ struct iwx_ltr_config_cmd {
 #define IWX_POWER_FLAGS_ADVANCE_PM_ENA_MSK        (1 << 9)
 #define IWX_POWER_FLAGS_LPRX_ENA_MSK            (1 << 11)
 #define IWX_POWER_FLAGS_UAPSD_MISBEHAVING_ENA_MSK    (1 << 12)
+#define IWX_POWER_FLAGS_ENABLE_SMPS_MSK            (1 << 14)
 
 #define IWX_POWER_VEC_SIZE 5
 
@@ -4972,9 +5969,44 @@ struct iwx_mac_power_cmd {
     uint8_t heavy_rx_thld_packets;
     uint8_t heavy_tx_thld_percentage;
     uint8_t heavy_rx_thld_percentage;
-    uint8_t limited_ps_threshold;
-    uint8_t reserved;
 } __packed;
+
+/*
+ * S103z: CLIENT_PM_POWER_TABLE_S_VER_3 -- the form THIS firmware's own TLV-48 declares for
+ * MAC_PM_POWER_TABLE (0xa9, group 0x01) at runtime: cmd_ver = 3, read from TLV 48 of
+ * iwlwifi-bz-b0-fm-c0-c106.ucode (md5 0f66e5beb95fff533664b5e5e5005694), 242 entries.
+ *
+ * Field-for-field from Linux iwlwifi `fw/api/power.h` `struct iwl_mac_power_cmd` (VER_3, 20 bytes).
+ * The VER_1/VER_2 form above is 40 bytes and is what EVERY other firmware image in this port
+ * declares (cmd_ver = 1 for all 12 non-Bz images).  Linux selects between them at
+ * `mld/power.c:406-421` on `iwl_fw_lookup_cmd_ver(fw, MAC_PM_POWER_TABLE, 0) >= 3`.
+ *
+ * NOTE: the two forms AGREE for bytes 0..15 and DIVERGE at 16..19 -- v3 ends with
+ * {lprx_rssi_threshold, skip_dtim_periods, qndp_tid, uapsd_ac_flags} where v2 still has
+ * rx_data_timeout_uapsd / tx_data_timeout_uapsd.  They are NOT truncations of one another, so
+ * this struct is a real type and not a size cast of the v2 one.
+ */
+struct iwx_mac_power_cmd_v3 {
+    /* CONTEXT_DESC_API_T_VER_1 */
+    uint32_t id_and_color;
+
+    /* CLIENT_PM_POWER_TABLE_S_VER_3 */
+    uint16_t flags;
+    uint16_t keep_alive_seconds;
+    uint32_t rx_data_timeout;
+    uint32_t tx_data_timeout;
+    uint8_t lprx_rssi_threshold;
+    uint8_t skip_dtim_periods;
+    uint8_t qndp_tid;
+    uint8_t uapsd_ac_flags;
+} __packed;
+
+/*
+ * S103z: the cmd_ver at and above which MAC_PM_POWER_TABLE takes the VER_3 form.  This is Linux's
+ * own threshold, `mld/power.c:408`.  It is compared against the value THIS firmware advertises in
+ * TLV-48, so the arm can never fire on a family that does not ask for it.
+ */
+#define IWX_MAC_POWER_CMD_VER_V3   3
 
 #define IWX_DEFAULT_PS_TX_DATA_TIMEOUT      (100 * 1000)
 #define IWX_DEFAULT_PS_RX_DATA_TIMEOUT      (100 * 1000)
@@ -5743,6 +6775,62 @@ struct iwx_tlc_config_cmd_v4 {
     uint16_t max_mpdu_len;
     uint16_t max_tx_op;
 } __packed; /* TLC_MNG_CONFIG_CMD_API_S_VER_4 */
+
+/**
+ * struct iwx_tlc_config_cmd - TLC configuration
+ * @sta_mask: station mask (in NAN we can have multiple logical stations of
+ *  the same peer (with the same TLC configuration)).
+ * @phy_id: the phy id to used for this TLC configuration
+ * @max_ch_width: max supported channel width from @enum iwx_tlc_mng_cfg_cw
+ * @mode: &enum iwx_tlc_mng_cfg_mode
+ * @chains: bitmask of IWX_TLC_MNG_CHAIN_*_MSK
+ * @sgi_ch_width_supp: bitmap of SGI support per channel width
+ *               use (1 << IWX_TLC_MNG_CFG_CW_*)
+ * @flags: bitmask of IWX_TLC_MNG_CFG_*
+ * @non_ht_rates: bitmap of supported legacy rates
+ * @ht_rates: bitmap of &enum iwx_tlc_mng_ht_rates, per <nss, channel-width>
+ *          pair (0 - 80mhz width and below, 1 - 160mhz, 2 - 320mhz).
+ * @max_mpdu_len: max MPDU length, in bytes
+ * @max_tx_op: max TXOP in uSecs for all AC (BK, BE, VO, VI),
+ *           set zero for no limit.
+ *
+ * ==== S103w V1 (THE VARIABLE): TRANSCRIBED FROM LINUX `fw/api/rs.h:227-239` =====================
+ * FW API tag `TLC_MNG_CONFIG_CMD_API_S_VER_6`.  THIS IMAGE'S OWN TLV-48 ROW SAYS
+ * `(05,0x0f) cmd_ver = 6` (MEASURED, `05-artifacts/s103/s103w-tlv.txt`), and the ONLY sender in
+ * either reference that serves ver 6 is Linux's MLD one, `iwl_mld_send_tlc_cmd()`
+ * (`mld/tlc.c:470-517`) -- the op mode THIS device selects (`IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT`,
+ * bit 110, 1 of 13 images) and the one this port took in S103q.
+ *
+ * MEASURED SIZES AND OFFSETS (host cc, the references' own definitions,
+ * `05-artifacts/s103/s103w-structsizes.txt`):
+ *      v3 = 28 B   v4 = 28 B   ver6 = 44 B
+ *      `ht_rates` element width: v3 = 2, v4 = 2, *** ver6 = 4 ***
+ *      field offsets, v4 -> ver6: max_ch_width 4->8, sgi_ch_width_supp 7->11, flags 8->12,
+ *      non_ht_rates 10->14, ht_rates 12->16, max_mpdu_len 24->40, max_tx_op 26->42.
+ * TWO FIELDS ARE NEW IN ver 6 (`sta_mask` @0 and `phy_id` @4 replace v4's `sta_id` + `reserved1[3]`).
+ * *** THE WIDENING IS THIS ROUND'S UNIT TRAP (S103v's rule): the SEMANTICS of `ht_rates` do not
+ * change -- it is a bitmap of IWX_TLC_MNG_HT_RATE_* bits -- but the CONTAINER doubles, and every
+ * field at or after `max_ch_width` moves.  A ver-6 command carrying the v4 bytes would be garbage in
+ * eleven fields, not merely four bytes short. ***
+ *
+ * Upstream OpenBSD `iwx` HAS NO ver-6 ARM AND NO ver-6 STRUCT (`if_iwx.c:8803-8805` sends the v3
+ * form for ANY `cmd_ver != 4`; `if_iwxreg.h:6514`/`:6547` are the only two TLC structs it has), and
+ * Linux's MVM ladder REFUSES ver 6 (`mvm/rs-fw.c:689-690 ret = -EINVAL`) exactly as this port did.
+ * LINUX-MLD GOVERNS (S103t's lesson, re-measured).
+ * ============================================================================================== */
+struct iwx_tlc_config_cmd {
+    uint32_t sta_mask;
+    uint32_t phy_id;
+    uint8_t max_ch_width;
+    uint8_t mode;
+    uint8_t chains;
+    uint8_t sgi_ch_width_supp;
+    uint16_t flags;
+    uint16_t non_ht_rates;
+    uint32_t ht_rates[IWX_TLC_NSS_MAX][IWX_TLC_MCS_PER_BW_NUM_V4];
+    uint16_t max_mpdu_len;
+    uint16_t max_tx_op;
+} __packed; /* TLC_MNG_CONFIG_CMD_API_S_VER_6 */
 
 /**
  * @IWX_TLC_NOTIF_FLAG_RATE: last initial rate update
@@ -7316,6 +8404,155 @@ struct iwx_scan_req_umac_v14 {
     struct iwx_scan_req_params_v14 scan_params;
 } __packed; /* SCAN_REQUEST_CMD_UMAC_API_S_VER_14 */
 
+/*
+ * ============================ S103n: THE v18 SCAN REQUEST FORM ============================
+ * ONE VARIABLE: the FORM of SCAN_REQ_UMAC (01.0d), selected by the firmware's own cmd-version table the
+ * way the reference's MLD op mode selects it -- iwl_mld_alloc_scan_cmd(), mld/scan.c:2169-2180:
+ *     scan_cmd_ver = iwl_fw_lookup_cmd_ver(mld->fw, SCAN_REQ_UMAC, IWL_FW_CMD_VER_UNKNOWN);
+ *     if (scan_cmd_ver == 17) ...v17...  else if (scan_cmd_ver == 18) ...v18...  else -EINVAL;
+ * This firmware's own TLV-48 says (0x01,0x0d) cmd_ver = 18 -- MEASURED --
+ * and TLV-31 says n_scan_channels = 68, which is EXACTLY SCAN_MAX_NUM_CHANS_V4 (== 67/68 for the other
+ * twelve images, which advertise cmd_ver 14 -- MEASURED, same parse).
+ *
+ * The declarations below mirror fw/api/scan.h:988, :1042-1048, :1138-1143 and :1175-1179 field for
+ * field.  THE ENVELOPE IS THE WHOLE CHANGE: iwx_scan_general_params_v10 (already in this header) is
+ * byte-for-byte the reference's iwl_scan_general_params_v11 (MEASURED: 36 B both, same member sizes in
+ * the same order), and iwx_scan_probe_params_v4 / iwx_scan_periodic_parms_v1 already exist and are
+ * reused unchanged.  The ONLY difference from the v14 envelope this port already builds is the channel
+ * array's bound: 67 -> 68 (== ONE 8-byte iwx_scan_channel_cfg_umac; MEASURED: 1948 - 1940 = 8).
+ * =========================================================================================
+ */
+#define IWX_SCAN_MAX_NUM_CHANS_V4 68
+
+/**
+ * struct iwx_scan_channel_params_v8 - channel params (SCAN_CHANNEL_PARAMS_API_S_VER_8)
+ * @flags: channel flags &enum iwx_scan_channel_flags
+ * @count: num of channels in scan request
+ * @n_aps_override: override the number of APs the FW uses to calculate dwell time
+ * @channel_config: array of explicit channel configurations, 68 entries
+ */
+struct iwx_scan_channel_params_v8 {
+    uint8_t flags;
+    uint8_t count;
+    uint8_t n_aps_override[2];
+    struct iwx_scan_channel_cfg_umac channel_config[IWX_SCAN_MAX_NUM_CHANS_V4];
+} __packed; /* SCAN_CHANNEL_PARAMS_API_S_VER_8 */
+
+/**
+ * struct iwx_scan_req_params_v18 - scan request parameters (v18)
+ * @general_params: &struct iwx_scan_general_params_v10 (== the reference's iwl_scan_general_params_v11)
+ * @channel_params: &struct iwx_scan_channel_params_v8
+ * @periodic_params: &struct iwx_scan_periodic_parms_v1
+ * @probe_params: &struct iwx_scan_probe_params_v4
+ */
+struct iwx_scan_req_params_v18 {
+    struct iwx_scan_general_params_v10 general_params;
+    struct iwx_scan_channel_params_v8 channel_params;
+    struct iwx_scan_periodic_parms_v1 periodic_params;
+    struct iwx_scan_probe_params_v4 probe_params;
+} __packed; /* SCAN_REQUEST_PARAMS_API_S_VER_18 */
+
+/**
+ * struct iwx_scan_req_umac_v18 - scan request command (v18)
+ * @uid: scan id, &enum iwx_umac_scan_uid_offsets
+ * @ooc_priority: out of channel priority - &enum iwx_scan_priority
+ * @scan_params: scan parameters
+ */
+struct iwx_scan_req_umac_v18 {
+    uint32_t uid;
+    uint32_t ooc_priority;
+    struct iwx_scan_req_params_v18 scan_params;
+} __packed; /* SCAN_REQUEST_CMD_UMAC_API_S_VER_18 */
+
+/*
+ * S103n SIZE AND OFFSET GATES (compile-gated, so "1948" and "548" and the two offsets are CHECKS and not
+ * claims -- 0gj).  `__packed` is `__attribute__((packed)) __attribute__((aligned(1)))`, so there is no
+ * padding to lose and offsetof is the true wire offset.  The arithmetic, all MEASURED by the standalone
+ * TU 07-scripts/s103n-sizes.c (which ALSO reproduces the base's measured 1820 send exactly, as its own
+ * control -- 52 + 68*8 + 1224 = 1820):
+ *     channel_cfg_umac            4 + max(3)                       =   8
+ *     channel_params_v8           1 + 1 + 2 + 68*8                = 548   (v6/[67] is 540)
+ *     general_params_v10          (MEASURED 36 both, == ref v11)   =  36
+ *     periodic_parms_v1           2*4 + 2 + 2                      =  12
+ *     probe_params_v4             532 + 4 + 20*34 + 8*4 + 16*6     = 1344
+ *     scan_req_params_v18         36 + 548 + 12 + 1344             = 1940
+ *     scan_req_umac_v18           4 + 4 + 1940                     = 1948
+ * A `typedef char x[cond ? 1 : -1]` fails to compile when the condition is false, which is the point.
+ */
+typedef char iwx_scan_channel_cfg_umac_must_be_8_bytes[
+    (sizeof(struct iwx_scan_channel_cfg_umac) == 8) ? 1 : -1];
+typedef char iwx_scan_channel_params_v8_must_be_548_bytes[
+    (sizeof(struct iwx_scan_channel_params_v8) == 548) ? 1 : -1];
+typedef char iwx_scan_channel_params_v8_channel_config_must_be_at_4[
+    (offsetof(struct iwx_scan_channel_params_v8, channel_config) == 4) ? 1 : -1];
+typedef char iwx_scan_channel_params_v8_count_must_be_at_1[
+    (offsetof(struct iwx_scan_channel_params_v8, count) == 1) ? 1 : -1];
+typedef char iwx_scan_general_params_v10_must_be_36_bytes[
+    (sizeof(struct iwx_scan_general_params_v10) == 36) ? 1 : -1];
+typedef char iwx_scan_probe_params_v4_must_be_1344_bytes[
+    (sizeof(struct iwx_scan_probe_params_v4) == 1344) ? 1 : -1];
+typedef char iwx_scan_req_params_v18_must_be_1940_bytes[
+    (sizeof(struct iwx_scan_req_params_v18) == 1940) ? 1 : -1];
+typedef char iwx_scan_req_umac_v18_must_be_1948_bytes[
+    (sizeof(struct iwx_scan_req_umac_v18) == 1948) ? 1 : -1];
+typedef char iwx_scan_req_umac_v18_channel_params_must_be_at_44[
+    (offsetof(struct iwx_scan_req_umac_v18, scan_params.channel_params) == 44) ? 1 : -1];
+typedef char iwx_scan_req_umac_v18_periodic_params_must_be_at_592[
+    (offsetof(struct iwx_scan_req_umac_v18, scan_params.periodic_params) == 592) ? 1 : -1];
+typedef char iwx_scan_req_umac_v18_probe_params_must_be_at_604[
+    (offsetof(struct iwx_scan_req_umac_v18, scan_params.probe_params) == 604) ? 1 : -1];
+typedef char iwx_scan_req_umac_v14_must_be_1940_bytes[
+    (sizeof(struct iwx_scan_req_umac_v14) == 1940) ? 1 : -1];
+typedef char iwx_scan_req_umac_v18_minus_v14_must_be_one_channel_cfg[
+    ((sizeof(struct iwx_scan_req_umac_v18) - sizeof(struct iwx_scan_req_umac_v14)) ==
+     sizeof(struct iwx_scan_channel_cfg_umac)) ? 1 : -1];
+
+/*
+ * ==================== S103o: WHERE A CHANNEL'S BAND GOES IN A SCAN REQUEST ====================
+ * The reference's TWO op modes DISAGREE about this, and the disagreement is exactly why this round
+ * exists:
+ *   mvm  iwl_mvm_umac_scan_cfg_channels()      mvm/scan.c:1600-1601, :1629
+ *        -> channel_cfg[i].v2.band = ...        (the LEGACY byte, offset 5); `flags` bits 30-31 LEFT 0
+ *   mld  iwl_mld_scan_cmd_set_channels()       mld/scan.c:880-881
+ *        -> cfg->flags |= iwl_band << IWL_CHAN_CFG_FLAGS_BAND_POS;   (`v2.band` NEVER written)
+ * with IWL_CHAN_CFG_FLAGS_BAND_POS == 30 (fw/api/scan.h:748) and the counter-intuitive encoding
+ * PHY_BAND_5 == 0, PHY_BAND_24 == 1, PHY_BAND_6 == 2 (fw/api/phy-ctxt.h:11-13) -- so "flags bits 30-31
+ * == 0" MEANS 5 GHz.  The port had the mvm placement; this device runs the MLD op mode.
+ *
+ * The assertions below are CHECKS, not claims: a `typedef char x[cond ? 1 : -1]` fails to compile when
+ * the condition is false.  They pin BOTH the struct layout the transform reads and the band encoding it
+ * shifts, so neither can silently flip.
+ * =============================================================================================
+ */
+#define IWX_CHAN_CFG_FLAGS_BAND_POS 30
+
+typedef char iwx_chan_cfg_flags_band_pos_must_be_30[
+    (IWX_CHAN_CFG_FLAGS_BAND_POS == 30) ? 1 : -1];
+typedef char iwx_scan_channel_cfg_flags_must_be_at_0[
+    (offsetof(struct iwx_scan_channel_cfg_umac, flags) == 0) ? 1 : -1];
+typedef char iwx_scan_channel_cfg_v2_band_must_be_at_5[
+    (offsetof(struct iwx_scan_channel_cfg_umac, v2.band) == 5) ? 1 : -1];
+/* S103o CAUGHT BY THE COMPILER (0gf): this port declares `channel_num` INSIDE each union view, while
+ * the reference has it OUTSIDE the union as a shared u8 at offset 4 (fw/api/scan.h:750).  The WIRE
+ * layout is identical -- which is what matters -- but the C access path is not, so the instrument had
+ * to be written as `.v2.channel_num`.  These two assertions PIN that equivalence instead of assuming
+ * it: both union views must place channel_num at the same offset, or the port's struct is not the
+ * reference's struct. */
+typedef char iwx_scan_channel_cfg_v2_channel_num_must_be_at_4[
+    (offsetof(struct iwx_scan_channel_cfg_umac, v2.channel_num) == 4) ? 1 : -1];
+typedef char iwx_scan_channel_cfg_v1_channel_num_must_be_at_4[
+    (offsetof(struct iwx_scan_channel_cfg_umac, v1.channel_num) == 4) ? 1 : -1];
+typedef char iwx_scan_channel_cfg_umac_must_still_be_8_bytes[
+    (sizeof(struct iwx_scan_channel_cfg_umac) == 8) ? 1 : -1];
+typedef char iwx_phy_band_5_must_be_0[
+    (IWX_PHY_BAND_5 == 0) ? 1 : -1];
+typedef char iwx_phy_band_24_must_be_1[
+    (IWX_PHY_BAND_24 == 1) ? 1 : -1];
+typedef char iwx_band_24_shifted_must_be_0x40000000[
+    (((uint32_t)IWX_PHY_BAND_24 << IWX_CHAN_CFG_FLAGS_BAND_POS) == 0x40000000) ? 1 : -1];
+typedef char iwx_band_5_shifted_must_be_0[
+    (((uint32_t)IWX_PHY_BAND_5 << IWX_CHAN_CFG_FLAGS_BAND_POS) == 0) ? 1 : -1];
+
 /**
  * struct iwx_umac_scan_abort
  * @uid: scan id, &enum iwx_umac_scan_uid_offsets
@@ -7684,6 +8921,25 @@ struct iwx_add_sta_cmd {
     uint8_t uapsd_acs;
 } __packed; /* ADD_STA_CMD_API_S_VER_10 */
 
+/*
+ * struct iwx_aux_sta_cmd - command for AUX STA configuration ( AUX_STA_CMD = 0xB )
+ * Mirror of fw/api/mac-cfg.h:986-1000 `struct iwl_aux_sta_cmd` (AUX_STA_CMD_API_S_VER_1); the same
+ * shape, renamed struct iwl_mvm_aux_sta_cmd, is in the 6.12.91 reference (mac-cfg.h:622-636), so the
+ * struct is stable across both references.  FOUR fields, 4+4+6+2 = SIXTEEN bytes packed -- NOT the
+ * twelve the brief for this round stated; the size is measured, and it changes the TFD shape
+ * (hdr 8 + 16 = 24 > IWX_FIRST_TB_SIZE 20 => num_tbs=2, tb0_len=20, tb1_len=4).
+ * @sta_id: index of the aux sta to configure
+ * @lmac_id: the lmac to use for aux activity (the reference writes IWL_LMAC_24G_INDEX = 0)
+ * @mac_addr: mac addr of the auxiliary sta (left zero: the reference's initializer sets neither)
+ * @reserved_for_mac_addr: reserved
+ */
+struct iwx_aux_sta_cmd {
+    uint32_t sta_id;
+    uint32_t lmac_id;
+    uint8_t mac_addr[6];
+    uint16_t reserved_for_mac_addr;
+} __packed; /* AUX_STA_CMD_API_S_VER_1 */
+
 /**
  * FW station types
  * ( REPLY_ADD_STA = 0x18 )
@@ -7927,6 +9183,61 @@ struct iwx_mcc_update_resp {
 } __packed; /* LAR_UPDATE_MCC_CMD_RESP_S_VER_4 */
 
 /**
+ * struct iwx_mcc_update_resp_v8 - response to MCC_UPDATE_CMD (LAR_UPDATE_MCC_CMD_RESP_S_VER_8).
+ *
+ * S103m: the form THIS firmware is told to expect.  Its own TLV-48 advertises
+ * (group 0x01, cmd 0xc8) cmd_ver = 1, notif_ver = 9, and the reference selects the response struct by
+ * exactly that version (mvm/nvm.c:436-438: `notif_ver >= 8` -> _v8).  Byte-for-byte the reference's
+ * layout (fw/api/nvm-reg.h:404-418).
+ *
+ * The difference from _v4 above is EXACTLY what made the port's parse return EIO: the two bytes after
+ * `mcc` are PADDING here (in _v4 they are the low half of `cap`), `cap` is a u32 (not a u16), and
+ * `n_channels` therefore sits at offset 20 instead of 16.
+ *
+ * @status: see &enum iwx_mcc_update_status
+ * @mcc: the new applied MCC
+ * @padding: padding for 2 bytes
+ * @cap: capabilities for all channels which matches the MCC
+ * @time: time elapsed from the MCC test start (in units of 30 seconds)
+ * @geo_info: geographic specific profile information, see IWX_GEO_*
+ * @source_id: the MCC source, see IWX_MCC_SOURCE_*
+ * @reserved: for four bytes alignment
+ * @n_channels: number of channels in @channels_data
+ * @channels: channel control data map, DWORD for each channel.  Only the first 16 bits are used.
+ */
+struct iwx_mcc_update_resp_v8 {
+    uint32_t status;
+    uint16_t mcc;
+    uint8_t padding[2];
+    uint32_t cap;
+    uint16_t time;
+    uint16_t geo_info;
+    uint8_t source_id;
+    uint8_t reserved[3];
+    uint32_t n_channels;
+    uint32_t channels[0];
+} __packed; /* LAR_UPDATE_MCC_CMD_RESP_S_VER_8 */
+
+/*
+ * S103m SIZE AND OFFSET GATES (compile-gated, so "24 vs 20" and "20 vs 16" are CHECKS and not claims --
+ * 0gj).  `__packed` is `__attribute__((packed)) __attribute__((aligned(1)))`, so there is no padding to
+ * lose and offsetof is the true wire offset:
+ *     _v8: 4 + 2 + 2 (padding) + 4 (cap) + 2 + 2 + 1 + 3 + 4 = 24, n_channels at 4+2+2+4+2+2+1+3 = 20
+ *     _v4: 4 + 2 + 2 (cap u16) + 2 + 2 + 1 + 3 + 4     = 20, n_channels at 4+2+2+2+2+1+3     = 16
+ * A `typedef char x[cond ? 1 : -1]` fails to compile when the condition is false, which is the point.
+ */
+typedef char iwx_mcc_update_resp_v8_header_must_be_24_bytes[
+    (sizeof(struct iwx_mcc_update_resp_v8) == 24) ? 1 : -1];
+typedef char iwx_mcc_update_resp_v8_n_channels_must_be_at_20[
+    (offsetof(struct iwx_mcc_update_resp_v8, n_channels) == 20) ? 1 : -1];
+typedef char iwx_mcc_update_resp_v8_channels_must_be_at_24[
+    (offsetof(struct iwx_mcc_update_resp_v8, channels) == 24) ? 1 : -1];
+typedef char iwx_mcc_update_resp_must_be_20_bytes[
+    (sizeof(struct iwx_mcc_update_resp) == 20) ? 1 : -1];
+typedef char iwx_mcc_update_resp_n_channels_must_be_at_16[
+    (offsetof(struct iwx_mcc_update_resp, n_channels) == 16) ? 1 : -1];
+
+/**
  * struct iwx_mcc_chub_notif - chub notifies of mcc change
  * (MCC_CHUB_UPDATE_CMD = 0xc9)
  * The Chub (Communication Hub, CommsHUB) is a HW component that connects to
@@ -8010,6 +9321,26 @@ iwx_cmd_id(uint8_t opcode, uint8_t groupid, uint8_t version)
 
 /* make uint16_t wide id out of uint8_t group and opcode */
 #define IWX_WIDE_ID(grp, opcode) ((grp << 8) | opcode)
+
+/*
+ * ==== S103ah B5-02 RELOCATION -- S103ag B5a's compile-time identity gates, MOVED HERE (0ih) ====
+ * Same six checks, same names, same conditions, byte-identical text: ONLY THE POSITION CHANGED,
+ * because a typedef gate is subject to C's declaration-before-use rule exactly like any other
+ * declaration.  THIS IS THE LAST POINT IN THIS HEADER AT WHICH ALL FOUR DEPENDENCIES EXIST:
+ *   IWX_SEC_KEY_FLAG_CIPHER_CCMP / _MCAST_KEY .... B5-01's own block (above)
+ *   IWX_DATA_PATH_GROUP .......................... :2379
+ *   IWX_FW_CTXT_ACTION_ADD / _REMOVE ............. :3385 / :3387
+ *   IWX_WIDE_ID .................................. HERE
+ * A FALSE CONDITION IS STILL A NEGATIVE ARRAY SIZE AND STILL FAILS THE BUILD (0gs).
+ * ============================================================================================
+ */
+typedef char iwx_s103ag_seckey_wide_id[
+    (IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_SEC_KEY_CMD) == 0x518) ? 1 : -1];
+typedef char iwx_s103ag_seckey_add_is_1[(IWX_FW_CTXT_ACTION_ADD == 1) ? 1 : -1];
+typedef char iwx_s103ag_seckey_remove_is_3[(IWX_FW_CTXT_ACTION_REMOVE == 3) ? 1 : -1];
+typedef char iwx_s103ag_seckey_ccmp_is_2[(IWX_SEC_KEY_FLAG_CIPHER_CCMP == 0x02) ? 1 : -1];
+typedef char iwx_s103ag_seckey_mcast_is_0x40[(IWX_SEC_KEY_FLAG_MCAST_KEY == 0x40) ? 1 : -1];
+typedef char iwx_s103ag_seckey_size[(sizeof(struct iwx_sec_key_cmd) == 80) ? 1 : -1];
 
 struct iwx_cmd_header {
     uint8_t cmd;
@@ -8106,11 +9437,23 @@ iwx_rx_packet_payload_len(const struct iwx_rx_packet *pkt)
 #define IWX_MIN_DBM    -100
 #define IWX_MAX_DBM    -33    /* realistic guess */
 
+/* ==== S90 REGISTER CHANNEL (temporary round instrument; DELETE BEFORE PR) ====
+ * PASSIVE.  These two functions perform EXACTLY the bus access the macro body
+ * performed and then append one 8-byte record to a static ring.  They add ZERO
+ * device access, so this instrument cannot move the firmware state it measures
+ * -- which is what 0xd00d0138 and the forbidden 0xa5cffc read did.
+ * The macros are used in ONE translation unit (ItlIwx.cpp), so there is no
+ * cross-TU linkage question.  Ring, capacity, freeze and publish site:
+ * ItlIwx.cpp "S90 REGISTER CHANNEL". ========================================= */
+struct iwx_softc;
+uint32_t iwxabS90Rd(struct iwx_softc *, uint32_t);
+void     iwxabS90Wr(struct iwx_softc *, uint32_t, uint32_t);
+
 #define IWX_READ(sc, reg)                        \
-    bus_space_read_4((sc)->sc_st, (sc)->sc_sh, (reg))
+    iwxabS90Rd((sc), (reg))
 
 #define IWX_WRITE(sc, reg, val)                        \
-    bus_space_write_4((sc)->sc_st, (sc)->sc_sh, (reg), (val))
+    iwxabS90Wr((sc), (reg), (val))
 
 #define IWX_WRITE64(sc, reg, val)                        \
 do {   \

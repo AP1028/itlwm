@@ -77,6 +77,9 @@ struct ieee80211_node;
 struct ieee80211_rxinfo;
 struct ieee80211_rsnparams;
 extern	void ieee80211_set_link_state(struct ieee80211com *, int);
+/* S196: returns 1 iff the state machine was moved to a DIFFERENT BSS (an AUTH->AUTH
+ * transition), 0 if no alternative from the same ESS is known or the same AP was chosen. */
+extern	int ieee80211_try_another_bss(struct ieee80211com *);
 extern	u_int ieee80211_get_hdrlen(const struct ieee80211_frame *);
 extern	int ieee80211_classify(struct ieee80211com *, mbuf_t);
 extern	void ieee80211_inputm(struct _ifnet *, mbuf_t,

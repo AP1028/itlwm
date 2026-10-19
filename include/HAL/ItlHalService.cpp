@@ -82,12 +82,6 @@ void ItlHalService::
 free()
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
-#ifdef AIRPORT_VTD
-    if (dmaArena) {
-        dmaArena->destroy();
-        dmaArena = nullptr;
-    }
-#endif
     if (this->mainWorkLoop) {
         this->mainWorkLoop->release();
     }
@@ -109,13 +103,3 @@ free()
     this->controller = NULL;
     super::free();
 }
-
-#ifdef AIRPORT_VTD
-bool ItlHalService::prepareDma(IOPCIDevice *device, uint8_t addressBits)
-{
-    if (dmaArena || !mainWorkLoop || mainWorkLoop->inGate())
-        return false;
-    dmaArena = ItlDmaArena::create(device, controller, addressBits);
-    return dmaArena != nullptr;
-}
-#endif

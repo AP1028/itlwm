@@ -110,7 +110,6 @@
 
 #include <IOKit/network/IOMbufMemoryCursor.h>
 #include <IOKit/IODMACommand.h>
-#include <HAL/ItlTx.hpp>
 
 #define IWL_CFG_ANY (~0)
 
@@ -225,7 +224,15 @@ struct iwx_tx_radiotap_header {
 	 (1 << IEEE80211_RADIOTAP_RATE) |				\
 	 (1 << IEEE80211_RADIOTAP_CHANNEL))
 
-#define IWX_UCODE_SECT_MAX 60
+/*
+ * Bz firmware (iwlwifi-bz-b0-fm-c0-c106.ucode) carries SEVENTY-ONE
+ * IWX_UCODE_TLV_SEC_RT sections. The AX210-era limit of 60 caused
+ * iwx_firmware_store_section() to return EINVAL on the 61st, which
+ * iwx_read_firmware propagates as its own error - so iwx_load_firmware aborts
+ * with 'if (err) return err' and never reaches iwx_start_fw/ALIVE. Raised to
+ * cover this image with headroom.
+ */
+#define IWX_UCODE_SECT_MAX 96
 
 /*
  * fw_status is used to determine if we've already parsed the firmware file
@@ -321,9 +328,6 @@ struct iwx_host_cmd {
  */
 
 struct iwx_dma_info {
-#ifdef AIRPORT_VTD
-    ItlDmaBuffer mapping;
-#endif
 	IOBufferMemoryDescriptor* buffer;
     bus_addr_t        paddr;
     void             *vaddr;
@@ -339,8 +343,6 @@ struct iwx_tx_data {
 	struct iwx_node *in;
     int flags;
 #define IWX_TXDATA_FLAG_CMD_IS_NARROW  0x01
-#define IWX_TXDATA_FLAG_CMD_PENDING    0x02
-#define IWX_TXDATA_FLAG_CMD_WAITING    0x04
     uint8_t type;
 };
 
@@ -348,6 +350,16 @@ struct iwx_tx_ring {
 	struct iwx_dma_info	desc_dma;
 	struct iwx_dma_info	cmd_dma;
 	struct iwx_dma_info	bc_tbl;
+	/*
+	 * Round S52: Linux's dedicated first-TB buffer.  Each TFD's TB0 points at
+	 * a 64-byte-aligned slot in its own allocation and carries a COPY of the
+	 * first IWX_FIRST_TB_SIZE bytes of the command; TB1 still points into the
+	 * command buffer at +IWL_FIRST_TB_SIZE (iwl_txq_get_first_tb_dma(),
+	 * txq->first_tb_bufs[], pcie/gen1_2/tx-gen2.c:1390-1412).  The port used
+	 * the command ring entry itself for TB0, the one structural difference left
+	 * between its command TFD and the reference's.
+	 */
+	struct iwx_dma_info	first_tb_dma;
 	struct iwx_tfh_tfd	*desc;
 	struct iwx_device_cmd	*cmd;
 	struct iwx_tx_data	data[IWX_MIN_256_BA_QUEUE_SIZE_GEN3];
@@ -356,11 +368,39 @@ struct iwx_tx_ring {
     unsigned int    low_mark;
 	int			qid;
 	int			queued;
+	/* S223: THIS QUEUE'S OWN DEADLINE, IN SECONDS (0 = disarmed).  A CLOCK, NOT THE
+	 * EVIDENCE: at zero the fuse re-reads `queued` on this same ring.  DELETE BEFORE
+	 * THE PR (0dp). */
+	int			wd_timer;
 	int			cur;
 	int			tail;
 };
 
-#define IWX_RX_MQ_RING_COUNT	512
+/*
+ * ==== FIX (round S10, Build B, uncommitted): RX RING COUNT FOR Bz ====
+ * Was 512 (the 22000/AX210 *non-HE* value) for every family.  Linux sizes the
+ * RX queue from the per-device config, not from the family:
+ *
+ *   pcie/rx.c:  if (trans->trans_cfg->mq_rx_supported)
+ *                   rxq->queue_size = trans->cfg->num_rbds;
+ *   cfg/bz.c:   #define IWL_NUM_RBDS_BZ_EHT (512 * 16)   ->  .num_rbds = 8192
+ *
+ * (AX210 by contrast is IWL_NUM_RBDS_AX210_HE = 4096 and the non-HE parts are
+ * 512 - so 512 was the wrong axis to key off.)  The count feeds three things:
+ * the RBD/completion/status ring allocations, the ring mask in iwx_rx_intr, and
+ * ctxt_info_gen3->mcr_size, where Linux writes
+ * RX_QUEUE_CB_SIZE(trans->cfg->num_rbds) = ilog2(8192) = 13 and the port was
+ * writing 9.  That field is inside the handoff the ROM reads before the kick.
+ *
+ * All 12 uses of the constant were traced before changing it:
+ *   if_iwxvar.h:365 (def), :380 (struct iwx_rx_data data[] - the only memory
+ *   cost: +120 KB in the softc, which already carries a 512 KB
+ *   sc_cmd_resp_pkt[]), ItlIwx.cpp:1253 (mcr_size), :2993 (free_desc_dma =
+ *   8192 * 16 B = 128 KB), :3012 (used_desc_dma, see the Bz descriptor below),
+ *   :3020/:3095/:12619/:12796 (loops), :12531 (mask 0x1ff -> 0x1fff),
+ *   :12536 (wrap) and :12544 (back-step).  All derive from the constant.
+ */
+#define IWX_RX_MQ_RING_COUNT	8192
 /* Linux driver optionally uses 8k buffer */
 #define IWX_RBUF_SIZE		4096
 
@@ -418,6 +458,19 @@ enum IWX_CMD_MODE {
 	IWX_CMD_ASYNC		= (1 << 0),
 	IWX_CMD_WANT_RESP	= (1 << 1),
 	IWX_CMD_SEND_IN_RFKILL	= (1 << 2),
+	/*
+	 * Round S46: do NOT rewrite a narrow (group 0) command id to LONG_GROUP
+	 * before sending it.  iwx_send_cmd() does that rewrite for every narrow id
+	 * ("Firmware API versions >= 50 reject old-style commands in group 0",
+	 * an OpenBSD-era workaround).  Linux does NOT rewrite: its host-command
+	 * builder takes group_id = iwl_cmd_groupid(cmd->id) and writes the 8-byte
+	 * wide header regardless, so a narrow id goes on the wire as group 0
+	 * (pcie/gen1_2/tx-gen2.c:1206, :1305-1313).  S45 measured that this
+	 * firmware ignores PHY_CONFIGURATION_CMD in every shape and size, and the
+	 * group is the one identity field in which the port and Linux differ for
+	 * that command.
+	 */
+	IWX_CMD_KEEP_NARROW_GROUP	= (1 << 3),
 };
 enum iwx_hcmd_dataflag {
 	IWX_HCMD_DFL_NOCOPY     = (1 << 0),
@@ -592,6 +645,31 @@ struct iwx_ba_task_data {
     uint32_t        stop_tidmask;
 };
 
+/* upstream if_iwxvar.h:441-445, verbatim (S103ag B5b) */
+struct iwx_setkey_task_arg {
+    int sta_id;
+    struct ieee80211_node *ni;
+    struct ieee80211_key *k;
+};
+
+/*
+ * S162: THE FIRMWARE RESET HANDSHAKE STATES, AND THE TIMEOUT.
+ * One for one with Linux's `enum iwl_trans_state`-adjacent `FW_RESET_*`
+ * (`pcie/gen1_2/trans-gen2.c:99-145`): `FW_RESET_IDLE` = 0, `FW_RESET_REQUESTED`,
+ * `FW_RESET_OK`.  The reference's `FW_RESET_ERROR` is deliberately NOT defined:
+ * it is set when an SW-error interrupt arrives during the handshake, and that
+ * branch is outside this round's scope (the port's SW-error handler keeps its
+ * existing behaviour; a handshake interrupted by a real firmware error simply
+ * times out and is counted as such).
+ * THE TIMEOUT IS THE REFERENCE'S NUMBER: `#define FW_RESET_TIMEOUT (HZ / 5)`
+ * (`pcie/gen1_2/trans-gen2.c:13`) = 200 ms at HZ=1000, and it is used for the
+ * `wait_event_timeout()` at `:118-120`.
+ */
+#define IWX_FW_RESET_TIMEOUT_MS	200
+#define IWX_FW_RESET_IDLE	0
+#define IWX_FW_RESET_REQUESTED	1
+#define IWX_FW_RESET_OK		2
+
 struct iwx_softc {
 	struct device sc_dev;
 	struct ieee80211com sc_ic;
@@ -607,6 +685,28 @@ struct iwx_softc {
 
 	/* Task for firmware BlockAck setup/teardown and its arguments. */
 	struct task	ba_task;
+
+	/*
+	 * ==== S103ag B5b: THE DEFERRED KEY INSTALL ===============================================
+	 * upstream if_iwxvar.h:657, :665-668 (the reference's own declarations):
+	 *     struct task                setkey_task;
+	 *     struct iwx_setkey_task_arg setkey_arg[3];
+	 *     int                        setkey_cur, setkey_tail, setkey_nkeys;
+	 * WHY IT IS NOT OPTIONAL -- MEASURED ON THE PORT'S OWN LOG, not argued:
+	 * every `iwx_cmd_done` completion in S103af ran on thread 0:674 (56 of 56), every
+	 * `PROBE S48 rx_pkt` ran on thread 0:674 (69 of 69), and BOTH `(01.17)` sends were issued
+	 * from thread 0:674 (S103af-port-log.txt:2279, :2283).  The reference's MLD install is
+	 * SYNCHRONOUS (if_iwx.c:9380 passes 0, not IWX_CMD_ASYNC, when remove_key == 0), so issuing
+	 * it inline from iwx_set_key() would tsleep_nsec() on the very thread that must deliver its
+	 * completion: a guaranteed 1-second timeout per key.  The reference avoids exactly that by
+	 * queueing the key on systq (if_iwx.c:9337-9347).  The port deleted that dispatch.
+	 * =========================================================================================
+	 */
+	struct iwx_setkey_task_arg	setkey_arg[3];
+	struct task			setkey_task;
+	int				setkey_cur;
+	int				setkey_tail;
+	int				setkey_nkeys;
     
     struct iwx_ba_task_data    ba_rx;
     struct iwx_ba_task_data    ba_tx;
@@ -629,7 +729,16 @@ struct iwx_softc {
 	/* TX/RX rings. */
 	struct iwx_tx_ring txq[IWX_MAX_TVQM_QUEUES];
 	struct iwx_rx_ring rxq;
-	ItlQueueMask<IWX_MAX_TVQM_QUEUES> qfullmsk;
+	int qfullmsk;
+	/* S103y D4 -- upstream if_iwx.c uses it at :2191 (iwx_reset_tx_ring, immediately after the
+	 * qfullmsk clear above), :2995 (iwx_enable_txq, on success), :3054 (iwx_disable_txq, after the
+	 * firmware serves the REMOVE), :7213 (the teardown's "only disable what is enabled" predicate)
+	 * and :3771/:3778 (iwx_addba).  THE INVARIANT: bit i is SET iff the firmware currently holds a
+	 * queue allocated for IWX_STATION_ID.  This port READ it at ONE site only -- the teardown --
+	 * because the :3771/:3778 readers are replaced here by TVQM (the firmware chooses the queue
+	 * id) and the :7210-7223 AGG loop is not carryable (see iwx_rm_sta's banner).  A field with a
+	 * reader is carried; a field without one would be dead state. */
+	uint32_t qenablemsk;
     struct iwx_tx_ring sc_tvqm_ring;
     int first_data_qid;
 
@@ -650,8 +759,92 @@ struct iwx_softc {
     const struct iwl_cfg_trans_params *sc_cfg_params;
     const struct iwl_cfg *sc_cfg;
 	int sc_device_family;
+    /*
+     * ==== SUP-P05 (offline triage, STRUCT/MECHANISM fix): THE OP-MODE SELECTOR ====
+     * Upstream's field, verbatim (`if_iwxvar.h:748`): `int sc_use_mld_api;`
+     * Set once, at `if_iwx.c:4576-4583`:
+     *     if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT) &&
+     *         (IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev) == IWX_CFG_MAC_TYPE_MA ||
+     *          sc->sc_device_family == IWX_DEVICE_FAMILY_BZ))
+     *             sc->sc_use_mld_api = 1;
+     * and read at six sites: `:5586`, `:6547`, `:6835-6836`, `:7171-7172`, `:8077-8078`, `:4583`.
+     * The port has NO counterpart (0 hits for `sc_use_mld_api` in all three delivering files), so
+     * it cannot express the distinction that decides which MAC-context command goes on the wire.
+     * Bz satisfies the gate on this device: `IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT` is bit 110 and
+     * the shipped Bz image sets it (census: `07-scripts/sup-tlv48.py`, caps word idx3 bit 14).
+     * ==============================================================================
+     */
+    int sc_use_mld_api;
 #define IWX_DEVICE_FAMILY_22000	1
 #define IWX_DEVICE_FAMILY_AX210	2
+/*
+ * Bz (Wi-Fi 7: BE200/BE201 and relatives). Added for BE201 support.
+ *
+ * This is a genuinely different generation from 22000/AX210, not a variation:
+ * Linux's iwl_bz_base specifies num_of_queues 512, max_tfd_queue_size 65536,
+ * gen2 context-info, integrated (CNVi) operation, apmg_not_supported,
+ * shadow_reg_enable, pcie_l1_allowed, and low-latency xtal at 12000.
+ *
+ * READ THIS BEFORE TRUSTING ANY Bz CODE PATH.
+ *
+ * The value 3 is ORDERED AFTER the existing families, and that has a
+ * consequence that is easy to get wrong: the 25 occurrences of
+ *
+ *     sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210
+ *
+ * evaluate TRUE for Bz, so Bz SILENTLY INHERITS the AX210/gen3 transport
+ * geometry at those sites (TFD queue size, RX descriptor format, rb_status
+ * size, BA queue size, context-info selection, ...). Only the 4 equality
+ * comparisons (== AX210, == 22000) fall through to neither branch.
+ *
+ * So the behaviour is a MIX, not "everything takes the else path".
+ *
+ * AUDIT of what the inherited gen3 path actually gives Bz (checked against
+ * Linux's iwl_bz_base, not assumed):
+ *
+ *   - IWX_TFD_QUEUE_SIZE_MAX_GEN3 = 65536 == Linux max_tfd_queue_size (Bz). OK.
+ *   - struct iwx_softc's txq[] is ALREADY dimensioned IWX_MAX_TVQM_QUEUES = 512,
+ *     which equals Linux num_of_queues (Bz). So the queue ARRAY is correctly
+ *     sized for Bz even though no Bz-specific code exists. OK.
+ *   - Context-info format: Linux consolidated this. There is a single
+ *     iwl_pcie_ctxt_info_init() setting version.version = 0 for all current
+ *     devices including Bz; the old ctxt-info-gen3.c no longer exists. Bz's
+ *     context-info is therefore expected to match the gen3 layout, so the
+ *     inherited path is plausibly right here too.
+ *   - The four uses of IWX_MAX_QUEUES (= 31) are DIAGNOSTIC dump loops only
+ *     (iwx_nic_error / driver-status printing). They under-report for Bz but
+ *     cannot cause a functional failure.
+ *
+ * Net: the inherited geometry is closer to correct for Bz than a naive reading
+ * suggests. What remains unverified is whether every one of the 25 sites is
+ * right -- in particular IWX_MIN_256_BA_QUEUE_SIZE_GEN3 and the RX descriptor
+ * sizing have not been checked against Bz -- and NONE of it is tested on
+ * hardware. Do not read this audit as a clean bill of health; read it as
+ * "the obvious failure did not reproduce on inspection".
+ *
+ * ROUND 30/31 CORRECTION — the context-info bullet above is now MEASURED WRONG
+ * and must not be relied on. The claim "Bz's context-info is therefore expected
+ * to match the gen3 layout" was an inference, and the firmware does not agree:
+ * with the inherited gen3 path, iwx_load_firmware's ALIVE handshake never
+ * completes. Measured on the device (rounds 28-30):
+ *
+ *     A sb1=0x00000000 sb2=0x03010801 upc=0xc00c040e lpc=0xc00c040c uc_ok=0 t=35
+ *     B upc=0xc00c040e lpc=0xc00c040c sb1=0x00000000 moved=NO-stalled
+ *     uc_intr=0 uc_ok=0
+ *
+ * i.e. the image is transferred, the CPU is kicked (UREG_CPU_INIT_RUN written
+ * through the correct 0x300000-offset window), the uCode begins executing and
+ * then HALTS both CPUs almost immediately (pc unchanged over 500ms, both parked
+ * in the 0xc00c040x region), and the ALIVE interrupt never fires. An immediate
+ * double-CPU halt on the first instructions is the signature of a fault during
+ * the uCode's own early init, and the context-info layout is the prime suspect:
+ * Linux's iwl_bz_mac_cfg sets .gen2 = true while this port selects
+ * iwx_ctxt_info_gen3_init for family >= AX210, which Bz satisfies.
+ *
+ * Also note Linux still has iwl-context-info-gen3.h and a gen3 init path, so the
+ * "Linux consolidated this" reasoning above was itself inaccurate.
+ */
+#define IWX_DEVICE_FAMILY_BZ	3
 
 	struct iwx_dma_info ctxt_info_dma;
 	struct iwx_self_init_dram init_dram;
@@ -665,7 +858,6 @@ struct iwx_softc {
 	int sc_init_complete;
 #define IWX_INIT_COMPLETE	0x01
 #define IWX_CALIB_COMPLETE	0x02
-#define IWX_PNVM_COMPLETE    0x04
 
 	struct iwx_ucode_status sc_uc;
 	char sc_fwver[32];
@@ -692,6 +884,43 @@ struct iwx_softc {
 	uint32_t sc_hw_init_mask;
 	uint32_t sc_fh_mask;
 	uint32_t sc_hw_mask;
+
+	/*
+	 * S162: THE FIRMWARE RESET HANDSHAKE -- THE TWO FIELDS LINUX HAS AS
+	 * `fw_reset_state` + `fw_reset_waitq` (`iwl-trans.h:1046-1049`;
+	 * `pcie/gen1_2/trans-gen2.c:99-145`).
+	 *
+	 * `sc_fw_reset_state` is Linux's `fw_reset_state`: IDLE before and after a
+	 * handshake, REQUESTED from the instant the doorbell is rung until the
+	 * bit-2 interrupt handler acknowledges it, OK once acknowledged.  Linux
+	 * additionally has ERROR for "an SW error interrupt arrived during the
+	 * handshake"; this port does not (see the note at the sender).
+	 *
+	 * `sc_fw_reset_wait` IS the wait channel, and it is a field rather than
+	 * `&sc_fw_reset_state` for one reason: the value of the state CHANGES at
+	 * exactly the moment the waiter must stop sleeping, and a channel whose
+	 * contents are also the condition makes every future reader re-derive
+	 * whether that is safe.  It is NEVER read or written as a value: its
+	 * ADDRESS is the sleep/wakeup identity, which is the port's own idiom
+	 * (`tsleep_nsec(desc, ...)` in iwx_send_cmd, and every `wakeupOn(&x)`
+	 * site).  A separate lock is not introduced: the only concurrent writer is
+	 * the interrupt action, every transition is one aligned int store, and the
+	 * wakeup is issued AFTER the store that makes it unnecessary to sleep
+	 * again -- the lost-wakeup rule the S43/S66 notes in ItlIwx.cpp state.
+	 */
+	int sc_fw_reset_state;		/* S162: IDLE / REQUESTED / OK              */
+	int sc_fw_reset_wait;		/* S162: the handshake's wait channel       */
+	/* S216: LINUX'S `trans->state >= IWL_TRANS_FW_STARTED` FOR THE HANDSHAKE.
+	 * 1 from the firmware's ALIVE until the driver DECLARES the firmware dead
+	 * (watchdog timeout, SW/HW error, CT kill) or SW_RESETs it.  The S162 gate
+	 * used `uc_ok`, which never clears, so every recovery stop handshook a
+	 * firmware that had already failed.  See iwx_stop_device(). */
+	int sc_fw_started;
+	/* S216: IWL_UCODE_MAJOR from the image's FW_VERSION TLV.  The TLV header's
+	 * `ver` field is NOT the major on this image (it reads 0x6a = API 106); the
+	 * firmware's own TLV says 106.c88d33af.0, which is what the Linux log prints
+	 * on this silicon.  The MVM version guard (0eaa1f24) uses this number. */
+	uint32_t sc_ucode_major;
 
 	int sc_generation;
 
@@ -767,6 +996,64 @@ struct iwx_softc {
 #define sc_txtap	sc_txtapu.th
 	int			sc_txtap_len;
 #endif
+
+    /*
+     * S103u: the receipt latch for the WIDE system-statistics request.  Upstream `if_iwx.c:8194`
+     * (cleared immediately before the send), `:8201-8206` (the bounded wait) and `:11356-11357`
+     * (the ONLY writer, the (0x02,0xfd) END-notification rx case).  APPENDED at the END of struct
+     * iwx_softc so that NO existing field offset moves -- a deliberate attribution choice, and the
+     * placement is the port's own because upstream's if_iwxvar.h is not in the reference set.
+     */
+    int sc_system_stats_cleared;
+
+    /*
+     * ==== S195: THE RESET-PATH DIRECTED SCAN =============================================
+     * APPENDED at the END of struct iwx_softc, as S103u's field above, so that NO existing
+     * field offset moves.  `sc_s195_reload` is set by `iwx_watchdog`'s deadline (the fire)
+     * and consumed by the `iwx_stop()` that the queued `init_task` runs; that stop is the
+     * ONLY one allowed to capture the known BSS.  `sc_s195_arm`/`sc_s195_chan`/
+     * `sc_s195_bssid` are that capture, consumed by the FIRST scan request after the reload
+     * (`iwx_scan()` clears the arm even when the request declined it).  A userspace down, a
+     * media change or an ioctl stop clears them, so a fresh association always starts with
+     * a full sweep.  See `iwx_umac_scan_fill_channels()`.
+     */
+    int sc_s195_reload;                     /* 1 = the next iwx_stop() is a reset reload */
+    int sc_s195_arm;                        /* 1 = the next scan may use one channel */
+    int sc_s195_chan;                       /* the known BSS's IEEE channel (0 = none) */
+    uint8_t sc_s195_bssid[ETHER_ADDR_LEN];  /* the known BSS's BSSID */
+
+    /*
+     * ==== S196: THE RUN TRANSITION'S CAPTURE (the S195 capture read the wrong instant) ======
+     * S195 captured the directed scan's channel at `iwx_stop()`'s teardown, from
+     * `ic_bss->ni_chan`.  That field is MOVED BY A SCAN -- `ieee80211_next_scan()` writes the
+     * first scan channel into the BSS node BEFORE the driver's `ic_state` becomes SCAN, and a
+     * background scan never changes the state at all -- so `st == RUN` at the teardown does NOT
+     * make `ni_chan` the RUN channel.  MEASURED (S195 control boot): one reload captured
+     * channel 1 while the BSSID/ESSID matched.  These fields are written at `iwx_run()`, the
+     * RUN transition itself, where the node is the BSS being handed to the firmware and
+     * `sc_phyctxt[0].channel` is the channel the firmware was just configured on; the teardown
+     * only COPIES them, and refuses unless the same BSS is still RUN on the same PHY channel.
+     * APPENDED at the END of struct iwx_softc, as S195's fields were, so no offset moves.
+     */
+    unsigned int sc_s196_run_seq;           /* RUN transitions observed (provenance) */
+    int sc_s196_run_chan;                   /* the RUN BSS's channel, at iwx_run() */
+    int sc_s196_run_esslen;
+    uint8_t sc_s196_run_bssid[ETHER_ADDR_LEN];
+    uint8_t sc_s196_run_essid[IEEE80211_NWID_LEN];
+
+    /*
+     * ==== S199: THE RETAINED ESS/CHANNEL SURVIVES THE DESELECT ==========================
+     * `ieee80211_deselect_ess()` zeroes `ic_des_essid`/`ic_des_esslen`, and the S195/S196
+     * scan site needs `n_ssids != 0` plus the captured BSS node still being the target, so
+     * an error re-init after a deselect scanned PASSIVE over 41 channels (measured S198
+     * out:#2: 4.6769 s = 85.5 % of the recovery).  The S196 RUN capture itself already
+     * survives `sc_newstate(INIT)` and the deselect (it lives in THIS struct); this field
+     * only records that the next `iwx_scan()` may spend it even though the state machine
+     * is no longer RUN and may be trying another candidate of the same ESS.  ONE SHOT:
+     * `iwx_scan()` consumes it whether or not the request used it, so the full sweep
+     * remains the structural fallback (`0rt`).  See `iwxabS199Arm()`.
+     */
+    int sc_s199_direct;                     /* 1 = next scan may use the retained RUN ESS/chan */
 };
 
 struct iwx_node {
@@ -778,6 +1065,20 @@ struct iwx_node {
 	uint16_t in_color;
     
     struct iwx_rxq_dup_data dup_data;
+
+	/*
+	 * ==== S103ah B5c: THE KEY-STATE BOOKKEEPING =================================================
+	 * upstream iwx if_iwxvar.h:846-849, verbatim (05-artifacts/research/
+	 * FETCHED-upstream-if_iwxvar.h.v1.50).  The port's `struct iwx_node` is that struct with these
+	 * four lines deleted and nothing else; MEASURED this round, not asserted.
+	 * The port had no `in_flags` and no IWX_NODE_FLAG_HAVE_* anywhere, which is why S103ag could not
+	 * carry the reference's completion tail (if_iwx.c:9518-9560) and DECLARED it instead.
+	 * =========================================================================================
+	 */
+	int in_flags;
+#define IWX_NODE_FLAG_HAVE_PAIRWISE_KEY		0x01
+#define IWX_NODE_FLAG_HAVE_GROUP_KEY		0x02
+#define IWX_NODE_FLAG_HAVE_INTEGRITY_GROUP_KEY	0x04
 };
 #define IWX_STATION_ID 0
 #define IWX_AUX_STA_ID 1

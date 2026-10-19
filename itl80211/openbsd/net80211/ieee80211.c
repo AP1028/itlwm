@@ -75,15 +75,59 @@ int	ieee80211_debug = 0;
 #endif
 
 ///compat for undefined symbols
-int _stop(struct kmod_info*, void*) {
-    IOLog("_stop(struct kmod_info*, void*) has been invoked\n");
+/*
+ * These MUST have C linkage, and MUST NOT carry a leading underscore in the
+ * source. Xcode compiles this file as C++ (GCC_INPUT_FILETYPE =
+ * sourcecode.cpp.cpp), so without extern "C" the names are mangled
+ * (`__Z6_startP9kmod_infoPv`) and kmod_info_t's start/stop pointers cannot bind.
+ * Separately, in C a source name of `_start` becomes `__start` in the Mach-O
+ * symbol table, because the toolchain adds its own leading underscore -- so the
+ * obvious name is the wrong one. Plain `itlwm_kmod_start` / `itlwm_kmod_stop`
+ * avoids both problems, and nothing outside this pair references the names.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int itlwm_kmod_stop(struct kmod_info*, void*) {
+    IOLog("itlwm_kmod_stop has been invoked\n");
     return 0;
 };
-int _start(struct kmod_info*, void*) {
-    IOLog("_start(struct kmod_info*, void*) has been invoked\n");
+int itlwm_kmod_start(struct kmod_info*, void*) {
+    IOLog("itlwm_kmod_start has been invoked\n");
     return 0;
 };
+#ifdef __cplusplus
+}
+#endif
 ///
+
+/*
+ * Xcode kext entry points for the AirportItlwm target.
+ *
+ * The build synthesises DerivedSources/AirportItlwm_info.c containing
+ *     KMOD_EXPLICIT_DECL(com.zxystd.AirportItlwm, "2.4.0", _start, _stop)
+ * and this project compiles every source as C++ (GCC_INPUT_FILETYPE =
+ * sourcecode.cpp.cpp), so those identifiers are C++-mangled:
+ *     __Z6_startP9kmod_infoPv / __Z5_stopP9kmod_infoPv
+ * Nothing in the tree defined them, so kmutil rejected the built kext with
+ *     Failed to bind '__Z6_startP9kmod_infoPv' in ...
+ *     as could not find a kext which exports this symbol
+ *
+ * These definitions MUST have C++ linkage. Written `extern "C"` they would
+ * emit `__start` and reproduce the same failure. They are no-ops
+ * returning 0, which is the contract the CLT path's
+ * itlwm_kmod_start / itlwm_kmod_stop pair already fulfils for the keeper.
+ */
+#ifdef __cplusplus
+int _start(struct kmod_info*, void*) {
+    IOLog("AirportItlwm kmod _start invoked\n");
+    return 0;
+}
+int _stop(struct kmod_info*, void*) {
+    IOLog("AirportItlwm kmod _stop invoked\n");
+    return 0;
+}
+#endif
 
 int ieee80211_cache_size = IEEE80211_CACHE_SIZE;
 
@@ -177,7 +221,6 @@ ieee80211_channel_init(struct _ifnet *ifp)
      * a default channel if not already specified.
      */
     memset(ic->ic_chan_avail, 0, sizeof(ic->ic_chan_avail));
-    ic->ic_caps &= ~IEEE80211_C_HE;
     ic->ic_modecaps |= 1<<IEEE80211_MODE_AUTO;
     for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
         c = &ic->ic_channels[i];
@@ -206,11 +249,7 @@ ieee80211_channel_init(struct _ifnet *ifp)
             if (IEEE80211_IS_CHAN_N(c))
                 ic->ic_modecaps |= 1<<IEEE80211_MODE_11N;
             if (IEEE80211_IS_CHAN_AC(c))
-                ic->ic_modecaps |= 1<<IEEE80211_MODE_11AC;
-            if (IEEE80211_IS_CHAN_N(c) && (ic->ic_flags & IEEE80211_F_HEON)) {
-                ic->ic_modecaps |= 1<<IEEE80211_MODE_11AX;
-                ic->ic_caps |= IEEE80211_C_HE;
-            }
+                ic->ic_modecaps |= 1<<IEEE80211_MODE_11AC | 1<<IEEE80211_MODE_11AX;
         }
     }
     /* validate ic->ic_curmode */
@@ -757,17 +796,17 @@ ieee80211_media_change(struct _ifnet *ifp)
     /*
      * Committed to changes, install the MCS/rate setting.
      */
-    ic->ic_flags &= ~(IEEE80211_F_HTON | IEEE80211_F_VHTON | IEEE80211_F_HEON);
+    ic->ic_flags &= ~(IEEE80211_F_HTON | IEEE80211_F_VHTON);
     ieee80211_configure_ampdu_tx(ic, 0);
     if ((ic->ic_modecaps & (1 << IEEE80211_MODE_11AX)) &&
         (newphymode == IEEE80211_MODE_AUTO ||
          newphymode == IEEE80211_MODE_11AX)) {
-        ic->ic_flags |= IEEE80211_F_HEON | IEEE80211_F_VHTON | IEEE80211_F_HTON;
+        ic->ic_flags |= IEEE80211_F_HEON;
         ieee80211_configure_ampdu_tx(ic, 1);
     } else if ((ic->ic_modecaps & (1 << IEEE80211_MODE_11AC)) &&
         (newphymode == IEEE80211_MODE_AUTO ||
          newphymode == IEEE80211_MODE_11AC)) {
-        ic->ic_flags |= IEEE80211_F_VHTON | IEEE80211_F_HTON;
+        ic->ic_flags |= IEEE80211_F_VHTON;
         ieee80211_configure_ampdu_tx(ic, 1);
     } else if ((ic->ic_modecaps & (1 << IEEE80211_MODE_11N)) &&
                (newphymode == IEEE80211_MODE_AUTO ||
@@ -917,10 +956,37 @@ ieee80211_watchdog(struct _ifnet *ifp)
             ni = ieee80211_find_node(ic, ic->ic_bss->ni_macaddr);
             if (ni)
                 ni->ni_fails++;
-            /* Try more times to join, some drivers will timeout when doing auth/assoc */
-            if (ic->ic_state == IEEE80211_S_AUTH && ni && ni->ni_fails < 3) {
-                ieee80211_node_join_bss(ic, ni);
-                goto done;
+            /*
+             * ==== S196: THE FIRST AUTH TIMEOUT CHANGES BSS, ONCE ==========================
+             * MEASURED (S195 fire 1): two IEEE80211_TRANS_WAIT (5 s) timeouts retrying the
+             * SAME BSS answering stale (the AP DEAUTHs reason 2/9 after the reset) while every
+             * local call returned err=0; fire->RUN 11.1476 s.  The scan already found the
+             * other APs, so the FIRST timeout spends its 5 s quantum on a DIFFERENT BSS from
+             * the same ESS, through the EXISTING ieee80211_try_another_bss() (an AUTH->AUTH
+             * transition, not a failed call and not a scan).
+             *
+             * BOUND N = 2 BSS ATTEMPTS.  `ic_mgt_bss_change` permits ONE change per
+             * association round; after it, the EXISTING `ni_fails < 3` ladder retries the
+             * current BSS and then the EXISTING SCAN fallback runs.  N is 2 because the
+             * measured scan cache holds exactly two BSSIDs of this ESS, one 5 s quantum is
+             * the only cost a second AP can add, and a third attempt would either repeat an
+             * AP already failed on or need the rescan that is already the fallback (0rk: the
+             * stale state is the AP's, so a ping-pong between its BSSes buys nothing).
+             * ============================================================================= */
+            if (ic->ic_state == IEEE80211_S_AUTH && ni) {
+                if (ic->ic_mgt_bss_change == 0 && ni->ni_fails == 1) {
+                    if (ieee80211_try_another_bss(ic)) {
+                        ic->ic_mgt_bss_change = 1;
+                        goto done;
+                    }
+                    XYLog("PROBE S196 bss_switch avail=0 ni_fails=%d\n",
+                          ni->ni_fails);
+                }
+                /* Try more times to join, some drivers will timeout when doing auth/assoc */
+                if (ni->ni_fails < 3) {
+                    ieee80211_node_join_bss(ic, ni);
+                    goto done;
+                }
             }
             if (ISSET(ic->ic_flags, IEEE80211_F_AUTO_JOIN))
                 ieee80211_deselect_ess(ic);

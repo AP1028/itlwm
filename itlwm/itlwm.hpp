@@ -59,6 +59,20 @@ public:
     virtual IOReturn setMulticastMode(IOEnetMulticastMode mode) override;
     virtual IOReturn setMulticastList(IOEthernetAddress* addr, UInt32 len) override;
     virtual bool configureInterface(IONetworkInterface *netif) override;
+    /*
+     * Read-only control channel, userspace -> driver.  This is an IOService method
+     * and `itlwm` IS the IOEthernetController, so the inbound dispatch lives here
+     * (NOT on ItlIwx, which is OSObject-based and cannot override it).
+     *
+     *   iwxctl == "status"  ->  fHalService->getCtlStatus(), published as the
+     *                           registry property "iwxctl_status" for readback
+     *                           with `ioreg -l` (there is no return channel from
+     *                           setProperties itself).
+     *
+     * Read-only: it never asks the HAL to bring anything up, so it cannot measure
+     * a path other than the one the driver already took at boot.
+     */
+    virtual IOReturn setProperties(OSObject *properties) override;
     virtual bool createWorkLoop() override;
     virtual IOWorkLoop* getWorkLoop() const override;
     virtual const OSString * newVendorString() const override;

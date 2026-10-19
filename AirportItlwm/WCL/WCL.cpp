@@ -17,6 +17,45 @@
 
 extern IOCommandGate *_fCommandGate;
 
+/* S246a: bounded post-DONE collection.  net80211 posts SCAN_DONE at the end of
+ * every sweep and immediately starts the next sweep at the first channel.  A
+ * request that joined a sweep already past the AP's channel therefore returns
+ * only if the result arrives before that DONE.  Keep the WCL scan open for a
+ * fixed WALL-CLOCK window after the first DONE so the sweep that starts at the
+ * DONE is collected too; the window is armed on the existing scanSource timer,
+ * never on a number of DONEs.  One full all-band sweep on this card is
+ * 4.1-4.7 s (measured, s103o: 01.0d sweeps end 4.11-4.68 s apart), so 5 s
+ * covers the sweep that begins at the DONE and finishes unconditionally.
+ * The initial 20 s timer is still the no-DONE fallback. */
+static const unsigned kScanCollectWindowMS = 5000;
+
+/* S246a: why does validIEs() reject a beacon the HAL delivered?  Walk the same
+ * bytes it walks and print the first offset that fails.  Pure log. */
+static void s246aIEWhy(const uint8_t *d, size_t len)
+{
+    if (!d) {
+        XYLog("S246a IEWHY null len=%zu\n", len);
+        return;
+    }
+    size_t off = 0, n = len;
+    while (n) {
+        if (n < 2) {
+            XYLog("S246a IEWHY short off=%zu rem=%zu\n", off, n);
+            return;
+        }
+        size_t e = size_t(d[1]) + 2;
+        if (e > n) {
+            XYLog("S246a IEWHY over off=%zu rem=%zu id=%u elen=%u\n",
+                off, n, unsigned(d[0]), unsigned(d[1]));
+            return;
+        }
+        d += e;
+        n -= e;
+        off += e;
+    }
+    XYLog("S246a IEWHY ok len=%zu\n", len);
+}
+
 struct AirportItlwmSkywalkInterface::CountryUpdate {
     AirportItlwmSkywalkInterface *interface;
     AirportItlwm *controller;
@@ -240,7 +279,26 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return kIOReturnBadArgument;
     ieee80211com *ic = fHalService->get80211Controller();
-    if (!(ic->ic_if.if_flags & IFF_RUNNING))
+    XYLog("S246a SCANREQ type=%u ssidlen=%u chans=%u state=%d pend=%d join=%d\n",
+        scan.type, scan.ssidLength, scan.channelCount, int(ic->ic_state),
+        scanPending, joinPending);
+    if (scan.channelCount) {
+        static unsigned s246a_chlog;
+        if (++s246a_chlog <= 6) {
+            unsigned n = 0;
+            for (unsigned channel = 1; channel <= IEEE80211_CHAN_MAX && n < 12; ++channel)
+                if (ic->ic_channels[channel].ic_flags &&
+                    AirportWCL::scanChannelSelected(scan.channels, true, channel)) {
+                    XYLog("S246a SCANCH ch=%u\n", channel);
+                    ++n;
+                }
+        }
+    }
+    /* S245a: a scan is legal on a POWERED interface.  On this 15.2 target IFF_RUNNING is
+     * set only by the association link-up, so requiring it here makes scanning impossible
+     * before the first association (measured: flags 0x8823, every CoreWLAN scan returned
+     * NotReady and never reached ieee80211_begin_scan).  Powered is IFF_UP. */
+    if (!(ic->ic_if.if_flags & IFF_UP))
         return kIOReturnNotReady;
     if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
         return kIOReturnBusy;
@@ -257,6 +315,10 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     }
     scanPending = true;
     scanCompleted = false;
+    scanDoneCount = 0;
+    scanBeaconCount = 0;
+    scanRxEvents = 0;
+    bzero(scanChannelsSeen, sizeof(scanChannelsSeen));
     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
         ((scan.type != 2 && scan.ssidLength != 0) ||
          ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
@@ -295,6 +357,12 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
     scanCompleted = false;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+    XYLog("S246a SCANFIN status=%d dones=%u results=%u rxev=%u\n",
+        int(status), scanDoneCount, scanBeaconCount, scanRxEvents);
+    scanDoneCount = 0;
+    scanBeaconCount = 0;
+    scanRxEvents = 0;
+    bzero(scanChannelsSeen, sizeof(scanChannelsSeen));
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
 }
 
@@ -306,20 +374,51 @@ void AirportItlwmSkywalkInterface::completeWCLScan()
 
 void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
 {
-    if (!node || node->ni_esslen > 32 || !AirportWCL::validIEs(ies, length))
+    if (!node || node->ni_esslen > 32) {
+        static unsigned s246a_rej_fmt;
+        if (scanPending && ++s246a_rej_fmt <= 5)
+            XYLog("S246a PUBREJ node esslen=%d len=%zu\n",
+                node ? int(node->ni_esslen) : -1, length);
         return;
+    }
+    /* S246a: this HAL's mpdu_len INCLUDES the 4-byte FCS.  Measured on every
+     * rejected beacon: validIEs() stops at "over ... rem=4" (the FCS tail), and
+     * the same bytes minus those 4 are valid IEs.  Drop the trailer only when
+     * that makes the IE run valid; the ScanResult then carries clean IEs. */
+    size_t ieLength = length;
+    if (!AirportWCL::validIEs(ies, ieLength)) {
+        if (ieLength >= 4 && AirportWCL::validIEs(ies, ieLength - 4)) {
+            ieLength -= 4;
+        } else {
+            static unsigned s246a_rej_ie;
+            if (scanPending && ++s246a_rej_ie <= 5) {
+                XYLog("S246a PUBREJ ie len=%zu\n", length);
+                s246aIEWhy(ies, length);
+            }
+            return;
+        }
+    }
     ieee80211com *ic = fHalService->get80211Controller();
-    if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC)
+    if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC) {
+        static unsigned s246a_rej_chan;
+        if (scanPending && ++s246a_rej_chan <= 5)
+            XYLog("S246a PUBREJ anyc esslen=%d len=%zu\n", int(node->ni_esslen), length);
         return;
+    }
     unsigned channel = ieee80211_chan2ieee(ic, node->ni_chan);
-    if (!channel || channel > 196)
+    if (!channel || channel > 196) {
+        static unsigned s246a_rej_num;
+        if (scanPending && ++s246a_rej_num <= 5)
+            XYLog("S246a PUBREJ num ch=%u esslen=%d len=%zu\n",
+                channel, int(node->ni_esslen), length);
         return;
-    size_t size = sizeof(AirportWCL::BeaconMetadata) + length;
+    }
+    size_t size = sizeof(AirportWCL::BeaconMetadata) + ieLength;
     auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
     if (!metadata)
         return;
     *metadata = {};
-    metadata->ieLength = uint32_t(length);
+    metadata->ieLength = uint32_t(ieLength);
     metadata->channelSpec = uint16_t(channel | (IEEE80211_IS_CHAN_5GHZ(node->ni_chan) ? 0xd000 : 0x1000));
     metadata->channel = channel;
     metadata->ssidLength = node->ni_esslen;
@@ -329,15 +428,23 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     metadata->interval = node->ni_intval;
     metadata->capability = node->ni_capinfo;
     metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
-    memcpy(metadata + 1, ies, length);
+    memcpy(metadata + 1, ies, ieLength);
     metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
-        reinterpret_cast<uint8_t *>(metadata + 1), length));
+        reinterpret_cast<uint8_t *>(metadata + 1), ieLength));
     size_t messageSize = sizeof(*metadata) + metadata->ieLength;
     if (assocNotified && IEEE80211_ADDR_EQ(node->ni_bssid, joinBSSID)) {
         wclBssValid = messageSize <= sizeof(wclBssInfo);
         if (wclBssValid) {
             bzero(wclBssInfo, sizeof(wclBssInfo));
             memcpy(wclBssInfo, metadata, messageSize);
+        }
+    }
+    if (scanPending) {
+        ++scanBeaconCount;
+        if (channel < 224 && !(scanChannelsSeen[channel / 32] & (1u << (channel % 32)))) {
+            scanChannelsSeen[channel / 32] |= 1u << (channel % 32);
+            XYLog("S246a CHAN ch=%u rssi=%d ssidlen=%d dones=%u\n",
+                channel, int(metadata->rssi), int(node->ni_esslen), scanDoneCount);
         }
     }
     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
@@ -415,6 +522,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
 {
     AirportWCL::JoinRequest join;
     if (!AirportWCL::decodeJoin(request, 0x2cc, join)) {
+        XYLog("S246a JOINDECODE fail\n");
         return kIOReturnBadArgument;
     }
     return startWCLJoin(join);
@@ -427,6 +535,10 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
     bool supported = auth != AirportWCL::LegacyAuth::Invalid;
     ieee80211com *ic = fHalService->get80211Controller();
+    XYLog("S246a JOINREQ ssidlen=%u bssid=%s auth=0x%x/0x%x keylen=%u state=%d scanpend=%d joinpend=%d\n",
+        unsigned(join.ssidLength), ether_sprintf(join.bssid),
+        unsigned(join.lowerAuth), unsigned(join.upperAuth),
+        unsigned(join.keyLength), int(ic->ic_state), scanPending, joinPending);
     // Applying a private MAC restarts firmware asynchronously. WCL can issue
     // the association before that restart has completed; keep one request
     // until the HAL reports READY rather than making the user retry it.
@@ -439,9 +551,19 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         joinTimer->setTimeoutMS(30000);
         return kIOReturnSuccess;
     }
-    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
+    /* S245a: same precondition as beginWCLScan -- powered, not yet associated.
+     * S246a: a JOIN SUPERSEDES A SCAN.  With the bounded collection window a
+     * scan is pending for up to 5 s after its first DONE; returning kIOReturnBusy
+     * here made airportd report "could not be joined" when the user clicked a
+     * network during that window (measured: no iwx_auth at all).  Finish the
+     * scan (airportd gets its ScanDone(aborted)) and take the join. */
+    if (!supported || !(ic->ic_if.if_flags & IFF_UP) || joinPending) {
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
+    }
+    if (scanPending) {
+        XYLog("S246a JOINPRESCAN dones=%u results=%u\n", scanDoneCount, scanBeaconCount);
+        finishWCLScan(kIOReturnAborted);
     }
     if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         leaveWCLNetwork();
@@ -702,6 +824,17 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             auto beacon = static_cast<ieee80211_beacon_event *>(data);
             if (!beacon)
                 break;
+            ++scanRxEvents;
+            if (scanPending && scanRxEvents <= 3 && beacon->node) {
+                XYLog("S246a RXEV n=%u state=%d chan=%d esslen=%d valid=%d len=%zu flen=%zu\n",
+                    scanRxEvents, int(ic->ic_state),
+                    ieee80211_chan2ieee(ic, beacon->node->ni_chan),
+                    int(beacon->node->ni_esslen),
+                    AirportWCL::validIEs(beacon->ies, beacon->length),
+                    beacon->length, beacon->frame_length);
+                if (!AirportWCL::validIEs(beacon->ies, beacon->length))
+                    s246aIEWhy(beacon->ies, beacon->length);
+            }
             // Retain the actual associated beacon, including its advancing TSF.
             // WCL polls BEACON_INFO to distinguish fresh reception from a stale BSS.
             if (assocNotified && (joinPending || portAuthorized) &&
@@ -765,9 +898,17 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             if (scanPending) {
                 if (scanSkipCompletion)
                     scanSkipCompletion = false;
-                else {
+                else if (!scanCompleted) {
+                    /* S246a: first DONE -- open the bounded window instead of
+                     * completing.  Any later DONE inside the window is counted
+                     * but does not extend or end it; the timer does both. */
                     scanCompleted = true;
-                    scanSource->setTimeoutMS(0);
+                    scanDoneCount = 1;
+                    scanSource->setTimeoutMS(kScanCollectWindowMS);
+                    XYLog("S246a SCANDONE first window_ms=%u\n", kScanCollectWindowMS);
+                } else {
+                    ++scanDoneCount;
+                    XYLog("S246a SCANDONE inside n=%u\n", scanDoneCount);
                 }
             }
             break;

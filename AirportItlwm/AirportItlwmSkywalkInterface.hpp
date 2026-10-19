@@ -449,6 +449,15 @@ private:
     bool scanPending;
     bool scanCompleted;
     bool scanSkipCompletion;
+    /* S246a: bounded collection after the first SCAN_DONE.  net80211 posts a
+     * DONE at the end of every sweep and the sweep in flight when the request
+     * arrives may already be past the AP's channel; the next sweep begins at
+     * that DONE.  Keep accepting ScanResults for a short wall-clock window
+     * after the DONE, then finish unconditionally.  No second DONE is needed. */
+    unsigned scanDoneCount;
+    unsigned scanBeaconCount;
+    unsigned scanRxEvents;
+    uint32_t scanChannelsSeen[7];
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

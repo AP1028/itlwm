@@ -89,9 +89,20 @@ extern int TX_TYPE_MGMT;
 
 extern int TX_TYPE_FRAME;
 
-extern int _stop(struct kmod_info*, void*);
+/*
+ * C linkage, and no leading underscore: see the comment in ieee80211.c. Declared
+ * as `_start` these would emit `__Z6_startP9kmod_infoPv` under C++ or `__start`
+ * under C, and the kernel-collection builder would reject the kext.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int itlwm_kmod_stop(struct kmod_info*, void*);
 
-extern int _start(struct kmod_info*, void*);
+extern int itlwm_kmod_start(struct kmod_info*, void*);
+#ifdef __cplusplus
+}
+#endif
 
 extern int timingsafe_bcmp(const void *b1, const void *b2, size_t n);
 
@@ -503,6 +514,13 @@ struct ieee80211com {
 	int16_t			ic_txpower;	/* tx power setting (dBm) */
 	int			ic_bmissthres;	/* beacon miss threshold */
 	int			ic_mgt_timer;	/* mgmt timeout */
+	/*
+	 * S196: the ONE BSS change this association round is allowed.  Set when the first AUTH
+	 * timeout moved to another BSS, cleared when the link reaches RUN and when a fresh
+	 * association starts (AUTH entered from SCAN).  N = 2 BSS attempts: current, then one
+	 * alternative; after that the existing `ni_fails < 3` ladder and SCAN fallback apply.
+	 */
+	int			ic_mgt_bss_change;
 #ifndef IEEE80211_STA_ONLY
 	CTimeout*		ic_inact_timeout; /* node inactivity timeout */
 	CTimeout*		ic_node_cache_timeout;

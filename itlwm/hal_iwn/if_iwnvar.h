@@ -72,9 +72,6 @@ struct iwn_tx_radiotap_header {
      (1 << IEEE80211_RADIOTAP_CHANNEL))
 
 struct iwn_dma_info {
-#ifdef AIRPORT_VTD
-    ItlDmaBuffer mapping;
-#endif
     IOBufferMemoryDescriptor* buffer;
     bus_addr_t        paddr;
     void             *vaddr;
@@ -84,10 +81,6 @@ struct iwn_dma_info {
 };
 
 struct iwn_tx_data {
-#ifdef AIRPORT_VTD
-    bool commandPending;
-    bool commandWaiting;
-#endif
     bus_dmamap_t        map;
     bus_addr_t        cmd_paddr;
     bus_addr_t        scratch_paddr;

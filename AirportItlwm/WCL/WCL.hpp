@@ -490,8 +490,18 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
             return LegacyAuth::Wep;
         return LegacyAuth::Invalid;
     }
-    const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10);
-    const uint32_t enterprise = (1u << 0) | (1u << 2) | (1u << 11);
+    /* S246a: WPA3 SAE / FT-SAE / WPA3-Enterprise bits (12..15 in
+     * include/Airport/apple80211_var.h) used to fall outside both masks and made
+     * the whole request Invalid -> kIOReturnUnsupported.  A WPA3-TRANSITION AP
+     * (the measured profile says security=wpa3-transition) advertises PSK
+     * alongside SAE, so map the SAE bits onto the same personal/enterprise
+     * families; startWCLJoin then selects the WPA2-PSK AKM that net80211 can
+     * actually run.  WPA3-only networks will fail later, honestly, at the
+     * handshake rather than being rejected as malformed here. */
+    const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10) |
+                              (1u << 12) | (1u << 13);
+    const uint32_t enterprise = (1u << 0) | (1u << 2) | (1u << 11) |
+                                (1u << 14) | (1u << 15);
     if (j.upperAuth & ~(personal | enterprise)) return LegacyAuth::Invalid;
     if ((j.upperAuth & personal) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
     if (j.upperAuth & personal)

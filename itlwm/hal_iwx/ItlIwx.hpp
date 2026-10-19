@@ -271,10 +271,20 @@ public:
     void    iwx_conf_msix_hw(struct iwx_softc *, int);
     int    iwx_start_hw(struct iwx_softc *);
     void    iwx_stop_device(struct iwx_softc *);
+    /* S162: THE FIRMWARE RESET HANDSHAKE.  `iwx_fw_reset_handshake` is the
+     * SENDER + WAITER that Linux runs before every stop_device on this family
+     * (`pcie/gen1_2/trans-gen2.c:99-145`); `iwx_fw_reset_done` is its RECEIVER,
+     * called from the bit-2 (RESET_DONE) arm of the MSI-X interrupt dispatch.
+     * Declared immediately after iwx_stop_device because that is their only
+     * caller and their subject. */
+    int     iwx_fw_reset_handshake(struct iwx_softc *);
+    void    iwx_fw_reset_done(struct iwx_softc *);
     void    iwx_nic_config(struct iwx_softc *);
     int    iwx_nic_rx_init(struct iwx_softc *);
     int    iwx_nic_init(struct iwx_softc *);
     int    iwx_enable_txq(struct iwx_softc *, int, int, int, int);
+    /* S103y D3b: upstream if_iwx.c declares it immediately after iwx_enable_txq's own block. */
+    int    iwx_disable_txq(struct iwx_softc *, int, int, uint8_t);
     int     iwx_tvqm_alloc_txq(struct iwx_softc *, int, int);
     int     iwx_tvqm_enable_txq(struct iwx_softc *, int, int, uint32_t);
     void    iwx_post_alive(struct iwx_softc *);
@@ -291,7 +301,6 @@ public:
     void    iwx_setup_ht_rates(struct iwx_softc *);
     void    iwx_setup_vht_rates(struct iwx_softc *);
     void    iwx_setup_he_rates(struct iwx_softc *);
-    int     iwx_config_he_sta(struct iwx_softc *, struct ieee80211_node *);
     int    iwx_mimo_enabled(struct iwx_softc *);
     static void    iwx_mac_ctxt_task(void *);
     static void    iwx_chan_ctxt_task(void *);
@@ -309,7 +318,7 @@ public:
     static void    iwx_rx_ba_session_expired(void *);
     static void    iwx_reorder_timer_expired(void *);
     static void    iwx_update_chw(struct ieee80211com *);
-    int     iwx_sta_rx_agg(struct iwx_softc *, struct ieee80211_node *, uint8_t,
+    void    iwx_sta_rx_agg(struct iwx_softc *, struct ieee80211_node *, uint8_t,
                            uint16_t, uint16_t, int, int);
     static int    iwx_ampdu_tx_start(struct ieee80211com *, struct ieee80211_node *,
             uint8_t);
@@ -361,7 +370,6 @@ public:
     int    iwx_phy_ctxt_cmd(struct iwx_softc *, struct iwx_phy_ctxt *, uint8_t,
             uint8_t, uint32_t, uint32_t);
     int    iwx_send_cmd(struct iwx_softc *, struct iwx_host_cmd *);
-    int    iwx_wait_notification(struct iwx_softc *, int *, int, uint32_t);
     int    iwx_send_cmd_pdu(struct iwx_softc *, uint32_t, uint32_t, uint16_t,
             const void *);
     int    iwx_send_cmd_status(struct iwx_softc *, struct iwx_host_cmd *,
@@ -386,6 +394,8 @@ public:
     void    iwx_power_build_cmd(struct iwx_softc *, struct iwx_node *,
             struct iwx_mac_power_cmd *);
     int    iwx_power_mac_update_mode(struct iwx_softc *, struct iwx_node *);
+    void    iwx_power_build_cmd_v3(struct iwx_softc *, struct iwx_node *,
+            struct iwx_mac_power_cmd_v3 *);
     int    iwx_power_update_device(struct iwx_softc *);
     int    iwx_enable_beacon_filter(struct iwx_softc *, struct iwx_node *);
     int    iwx_disable_beacon_filter(struct iwx_softc *);
@@ -405,6 +415,7 @@ public:
     int    iwx_umac_scan(struct iwx_softc *, int);
     int    iwx_umac_scan_v12(struct iwx_softc *, int);
     int    iwx_umac_scan_v14(struct iwx_softc *, int);
+    int    iwx_umac_scan_v18(struct iwx_softc *, int);   /* S103n: the MLD op mode's fixed-size v18 form */
     void    iwx_mcc_update(struct iwx_softc *, struct iwx_mcc_chub_notif *);
     uint8_t    iwx_ridx2rate(struct ieee80211_rateset *, int);
     int    iwx_rval2ridx(int);
@@ -415,7 +426,19 @@ public:
     void    iwx_mac_ctxt_cmd_fill_sta(struct iwx_softc *, struct iwx_node *,
             struct iwx_mac_data_sta *, int);
     int    iwx_mac_ctxt_cmd(struct iwx_softc *, struct iwx_node *, uint32_t, int);
+    /* SUP-P05: the MLD MAC-config sender, the reference's `iwx_mld_mac_ctxt_cmd` (`if_iwx.c:8108`). */
+    int    iwx_mld_mac_ctxt_cmd(struct iwx_softc *, struct iwx_node *, uint32_t, int);
+    /* S103t: THE MLD ADD/REMOVE SET -- upstream `if_iwx.c:6954` (83 L), `:7039` (121 L), `:7254` (33 L),
+     * and the two dispatches `:6835-6836` / `:7171-7172` that reach the first and the third.
+     * (AMENDMENT 1 of the S103t pre-registration: the port DOES declare `iwx_mld_mac_ctxt_cmd` here,
+     * so these three must be declared too -- the earlier "no declaration needed" premise was FALSE.) */
+    void    iwx_mld_modify_link_fill(struct iwx_softc *, struct iwx_node *,
+            struct iwx_link_config_cmd *, int, int);
+    int     iwx_mld_add_sta_cmd(struct iwx_softc *, struct iwx_node *, int);
+    int     iwx_mld_rm_sta_cmd(struct iwx_softc *, struct iwx_node *);
     int    iwx_clear_statistics(struct iwx_softc *);
+    int    iwx_send_statistics_cmd_clear(struct iwx_softc *);
+    int    iwx_send_system_statistics_cmd_clear(struct iwx_softc *);
     int    iwx_update_quotas(struct iwx_softc *, struct iwx_node *, int);
     void    iwx_add_task(struct iwx_softc *, struct taskq *, struct task *);
     void    iwx_del_task(struct iwx_softc *, struct taskq *, struct task *);
@@ -429,6 +452,8 @@ public:
     int    iwx_rs_init(struct iwx_softc *, struct iwx_node *, bool update);
     void iwx_rs_update(struct iwx_softc *sc, struct iwx_tlc_update_notif *notif);
     int    iwx_enable_mgmt_queue(struct iwx_softc *);
+    /* S103y D2: upstream declares it at if_iwx.c:450, two lines below iwx_enable_mgmt_queue (:449). */
+    int    iwx_disable_mgmt_queue(struct iwx_softc *);
     int    iwx_phy_ctxt_update(struct iwx_softc *, struct iwx_phy_ctxt *,
                                struct ieee80211_channel *, uint8_t, uint8_t, uint32_t);
     int    iwx_auth(struct iwx_softc *);
@@ -436,6 +461,22 @@ public:
     int    iwx_run(struct iwx_softc *);
     int    iwx_run_stop(struct iwx_softc *);
     static struct ieee80211_node *iwx_node_alloc(struct ieee80211com *);
+    /* ==== S103ah B5c: THE DECLARATIONS THE S103ag PATCHES REQUIRE (this is the G2 compile fix) ==
+     * A member function defined at file scope as `int ItlIwx::name(...)` must be DECLARED in the
+     * class.  S103ag's patches were proved to re-apply byte-exact and were never compiled; the
+     * compiler is what found this.
+     * `iwx_setkey_task` is `static` for the same reason `iwx_ba_task` is: it is handed to
+     * `task_set(&sc->setkey_task, iwx_setkey_task, sc, "iwx_setkey_task")`, which requires a plain
+     * `void (*)(void *)`.  The other three are declared static to match iwx_set_key/iwx_delete_key.
+     * DECLARATION ORDER (0ih) matches the DEFINITION order in ItlIwx.cpp. */
+    static int    iwx_mld_set_sta_key(struct iwx_softc *, struct ieee80211_node *,
+            struct ieee80211_key *, int);
+    static int    iwx_add_sta_key_legacy(struct iwx_softc *, int, struct ieee80211_node *,
+            struct ieee80211_key *);
+    static int    iwx_add_sta_key(struct iwx_softc *, int, struct ieee80211_node *,
+            struct ieee80211_key *);
+    static void    iwx_setkey_task(void *);
+
     static int    iwx_set_key(struct ieee80211com *, struct ieee80211_node *,
            struct ieee80211_key *);
     static void    iwx_delete_key(struct ieee80211com *,
@@ -460,6 +501,123 @@ public:
     const char *iwx_desc_lookup(uint32_t);
     void    iwx_nic_error(struct iwx_softc *);
     void    iwx_nic_umac_error(struct iwx_softc *);
+    /*
+     * Read-only control channel.  NOTE: this is the ONLY control-related
+     * declaration here.  setProperties() is an IOService method and ItlIwx is not
+     * an IOService (ItlHalService is OSObject-based), so the inbound dispatch
+     * lives on the IOEthernetController subclass in itlwm.cpp and calls through
+     * this virtual -- which is why ItlIwx.hpp stays otherwise untouched.
+     * Contract (return codes for every read, pure read, nic-lock caveat) is
+     * documented in ItlHalService.hpp.
+     */
+    OSString *getCtlStatus(void) override;
+    /* S217: "s217 drain 0|1", "s217 pre 0|1", "s217 recover", "s217 trace" -- the drain
+     * control and the deterministic recovery, reached through itlwm::setProperties. */
+    OSString *ctlS217(const char *cmd) override;
+    /* S217: the firmware-mediated drain, called from iwx_watchdog at 7 s of a stall. */
+    void     iwxabS217DrainAttempt(struct iwx_softc *sc);
+    void    iwxCtlPublish(const char *stage);
+    void    iwxCtlPublishRegTrace(const char *stage);   /* S90 */
+    /* Round S29 (R1): kick-relative time series.  Members, not file-statics,
+     * because they read prph through the unlocked MEMBER accessor
+     * (iwx_read_prph_unlocked).  Read-only; no register writes. */
+    void    iwxabSerSample(struct iwx_softc *, int);
+    void    iwxabSerChickPost(struct iwx_softc *);
+    void    iwxabS56ScdDump(struct iwx_softc *, const char *);
+    /* Round S30 (R2, stall-vs-halt): 2 ms cadence for ~10 s, logging ONLY on
+     * change plus a heartbeat, so "nothing ever changed" is provable. */
+    void    iwxabSerLongRun(struct iwx_softc *);
+    /* Round S34 (R3): the RX free-buffer write pointer, pushed the Bz way
+     * (HBUS_TARG_WRPTR with the RX queue encoding) instead of the AX210-only
+     * RFH_Q0_FRBDCB_WIDX_TRG, which is dead on this part.  Real code. */
+    void    iwx_rx_wrptr(struct iwx_softc *, uint32_t, const char *);
+    /* Round S60, instrument (1): the firmware's OWN error/assert/wait state,
+     * sampled at instants whose outcome is already known (control + first
+     * silent command + end of boot), plus each core's current PC read twice so
+     * "still executing" and "frozen" are separable.  READ-ONLY except for
+     * iwx_read_mem()'s NIC lock (which clears GP_CNTRL BIT(21), rule 0l);
+     * placed outside every change-logging cadence. */
+    void    iwxabS60FwState(struct iwx_softc *, const char *);
+    void    iwxabS60FwStateOnce(struct iwx_softc *, const char *);
+    /* Round S61: bracket the INSTANT the firmware asserts.  A 4-dword peek at
+     * the LMAC0 error table (UNLOCKED mem window, no nic lock) is taken at every
+     * command boundary and at every interrupt; the FIRST non-zero `valid` prints
+     * the tag it was seen at, then the full state and a raw dump of all three
+     * tables.  Diagnostics only; no behaviour change. */
+    uint32_t iwxabS60Peek(struct iwx_softc *, uint32_t, uint32_t *, int);
+    void    iwxabS60RawDump(struct iwx_softc *, const char *);
+    void    iwxabS60AssertWatch(struct iwx_softc *, const char *);
+    /* Round S63: 2 s of deliberate host silence (no command in flight) while the
+     * firmware's error table is sampled every 10 ms -- separates "the PHY
+     * configuration command kills it" from "it dies on its own". */
+    void    iwxabS63SilenceWatch(struct iwx_softc *, int);
+    /* Round S64: the PHY configuration command sent ASYNC (no response wait) and
+     * then sampled every 2 ms -- locates the assert inside the command's handling. */
+    void    iwxabS64Series(struct iwx_softc *, int);
+    /* Round S66: the assert record's instruction pointers, read as bytes through
+     * the device window so they can be matched into the firmware image. */
+    void    iwxabS66Backtrace(struct iwx_softc *, const char *);
+    /* Round S67: the firmware's OWN PC-register table (image TLV 68), read twice
+     * so frozen vs running is separable.  Corrects the S60/S61 mislabelled PCs. */
+    void    iwxabS67PCs(struct iwx_softc *, const char *);
+    /* Round S69: census of the firmware monitor buffer -- the positive control
+     * for "is firmware debug collection actually enabled now". */
+    void    iwxabS69MonitorCensus(struct iwx_softc *, const char *);
+    /* Round S72: PRPH 0xa01028 -- the ONE object the LMAC wait path names (the
+     * ARC image reads it exactly once in 2 MB, at 0x2a700e, just before it spins
+     * on bit 29 of r32 and then writes 0xa01024) -- plus the firmware's own
+     * snapshot of the extended register file r32..r45 at the fixed global
+     * 0x2f6ad4, sampled at instants matched to the reference driver's three.
+     * Read-only; uses the UNLOCKED accessors (iwx_read_prph asserts the nic
+     * lock and panics in a diagnostic context). */
+    void    iwxabS72Prph(struct iwx_softc *, const char *, int);
+    void    iwxabS72Sweep(struct iwx_softc *, const char *);
+    /* Round S74 (the offline round's measurement): the fields the S72 sweep's
+     * 8-dword window never reached -- the LMAC error table's word 20 (`log_pc` =
+     * the LIVE PC of the core that filled it), 23 (hcmd), 24 (isr0), 29
+     * (last_cmd_id) and 30 (the real `wait_event`), plus the UMAC record's complete
+     * 19 words.  Every burst is <= 8 dwords (the proven length); per-burst canaries
+     * on one line; after a dead canary the rest is VOID and is NOT read. */
+    void    iwxabS74AssertWords(struct iwx_softc *, const char *);
+    /* Round S79: the record's lifecycle by phase, and the long-window series the
+     * port never had.  `iwxabS79Lifecycle` reads the LMAC error record first (the
+     * proven object), then 0xa01e20 and 0xa01024 (both proven, canaried), and
+     * 0xa01e84 -- the assert path's handshake target, NEVER READ BEFORE -- last and
+     * only when `deep` is set.  `iwxabS79Series` samples {record, a01e20, a01024}
+     * every 2 ms for `iterations` samples: the window in which the CLEAN reference
+     * driver toggles a01e20 bit 12 and raises a01024 to 1, and in which the port's
+     * own 2000-sample series lasts only ~4 ms.  Read-only, unlocked accessors. */
+    void    iwxabS79Lifecycle(struct iwx_softc *, const char *, int);
+    void    iwxabS79Series(struct iwx_softc *, const char *, int);
+    /* Round S74b: the TIGHT ordering loop.  S74a's 2 ms series returned
+     * SAME_SAMPLE for the LMAC's and the UMAC's first-nonzero instants, which
+     * cannot separate "the UMAC wrote first" from "both wrote inside one tick".
+     * This one has no sleep at all and logs every change of both records' words
+     * 0/1 with its iteration index, so the order is resolved to one iteration. */
+    void    iwxabS74Tight(struct iwx_softc *, int);
+    /* Round S72i: the PORT-side counterpart of the reference driver's
+     * `iwxab_s72_series` -- a tight, bounded, log-on-change series over a01e20 and
+     * a01024 right after the ASYNC PHY-config kick, CHICK canary last in each
+     * iteration.  Three phase samples cannot see a flag that toggles between them
+     * (rule 0as); this is the series that can. */
+    void    iwxabS72Series(struct iwx_softc *, const char *, int);
+    /* Round S76 -- THE ONE-OFF DELIBERATE FIRMWARE PATCH.  In the boot that calls
+     * this, the port's firmware image is NOT the stock one: the byte-identical
+     * invariant is SUSPENDED and stated as suspended, and nothing measured in that
+     * boot may be compared as though the image were stock.  The patched image writes
+     * its diagnostics into the object the ALIVE notification already publishes as
+     * `dbg_print_buff_addr` -- the UMAC addresses it as 0x80255674, the host as
+     * 0x00255674 -- so this reads the EXISTING channel and invents no new mechanism.
+     * The cells live at 0x80247000 (host 0x00247000), inside the 32 KB all-zero
+     * section at 0x80240000 -- NOT inside the published object, whose +0x44..+0x78
+     * the S76b PRISTINE control boot showed to be live firmware data.  Reads are
+     * 8-dword bursts, each bracketed by the CHICK canary, and the published object
+     * is re-read as a control (rules 0an / 0aw / 0bf). */
+    void    iwxabS76DbgLog(struct iwx_softc *, const char *);
+    /* Round S67: the firmware's OWN PC-register table (image TLV 68), read twice
+     * so frozen vs running is separable.  Corrects the S60/S61 mislabelled PCs. */
+    /* Round S67: the firmware's OWN PC-register table (image TLV 68), read twice
+     * so frozen vs running is separable.  Corrects the S60/S61 mislabelled PCs. */
     void    iwx_flip_address(uint8_t *);
     int    iwx_detect_duplicate(struct iwx_softc *, mbuf_t,
             struct iwx_rx_mpdu_desc *, struct ieee80211_rxinfo *);

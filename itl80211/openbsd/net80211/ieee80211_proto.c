@@ -1116,12 +1116,31 @@ ieee80211_auth_open_confirm(struct ieee80211com *ic,
 }
 #endif
 
-void
+/* S196: the receipt line lives in a helper, so `ieee80211_try_another_bss`'s frame does not
+ * grow (`0om`).  ONE ether_sprintf: it returns ONE static buffer, so two calls in one printf
+ * would print the same address twice; the "from" is the preceding `op=auth bssid=` line. */
+static void
+ieee80211_bss_switch_log(struct ieee80211com *ic, struct ieee80211_node *selbs)
+{
+	struct _ifnet *ifp = &ic->ic_if;
+
+	XYLog("%s: PROBE S196 bss_switch to=%s chan=%d\n", ifp->if_xname,
+	    ether_sprintf(selbs->ni_macaddr),
+	    ieee80211_chan2ieee(ic, selbs->ni_chan));
+}
+
+/*
+ * S196: returns 1 iff the state machine was moved to a DIFFERENT BSS, 0 otherwise (no
+ * alternative from the same ESS is known, or the chosen node is the same AP).  The CALLER
+ * owns the budget: `ieee80211_watchdog()` spends this ONE change on the first AUTH timeout.
+ * This function never returns an error and never fails a call: it moves the EXISTING
+ * AUTH->AUTH transition, which is the path a retry already uses.
+ */
+int
 ieee80211_try_another_bss(struct ieee80211com *ic)
 {
     XYLog("%s\n", __FUNCTION__);
 	struct ieee80211_node *curbs, *selbs;
-	struct _ifnet *ifp = &ic->ic_if;
 
 	/* Don't select our current AP again. */
 	curbs = ieee80211_find_node(ic, ic->ic_bss->ni_macaddr);
@@ -1142,20 +1161,22 @@ ieee80211_try_another_bss(struct ieee80211com *ic)
 	}
 	selbs = ieee80211_node_choose_bss(ic, 0, NULL);
 	if (selbs == NULL)
-		return;
+		return 0;
 
-	/* Should not happen but seriously, don't try the same AP again. */
-	if (memcmp(selbs->ni_macaddr, ic->ic_bss->ni_macaddr,
-	    IEEE80211_NWID_LEN) == 0)
-		return;
+	/*
+	 * Should not happen but seriously, don't try the same AP again.  S196: this test used
+	 * `memcmp(..., IEEE80211_NWID_LEN)` -- 32 bytes of a 6-byte address, the ESSID's length
+	 * used on an address -- so "the same AP" could be missed.  The function now decides
+	 * whether the BSS change happens at all, so the address compare must be the address.
+	 */
+	if (IEEE80211_ADDR_EQ(selbs->ni_macaddr, ic->ic_bss->ni_macaddr))
+		return 0;
 
-	if (ifp->if_flags & IFF_DEBUG)
-		XYLog("%s: trying AP %s on channel %d instead\n",
-		    ifp->if_xname, ether_sprintf(selbs->ni_macaddr),
-		    ieee80211_chan2ieee(ic, selbs->ni_chan));
+	ieee80211_bss_switch_log(ic, selbs);
 
 	/* Triggers an AUTH->AUTH transition, avoiding another SCAN. */
 	ieee80211_node_join_bss(ic, selbs);
+	return 1;
 }
 
 void
@@ -1248,7 +1269,7 @@ ieee80211_auth_open(struct ieee80211com *ic, const struct ieee80211_frame *wh,
 			if (ni != ic->ic_bss)
 				ni->ni_fails++;
 			else
-				ieee80211_try_another_bss(ic);
+				(void)ieee80211_try_another_bss(ic);
 			ic->ic_stats.is_rx_auth_fail++;
 			return;
 		}
@@ -1487,6 +1508,12 @@ justcleanup:
         ieee80211_clean_sta_bss_node(ic);
 		if (ostate == IEEE80211_S_RUN)
 			ieee80211_check_wpa_supplicant_failure(ic, ni);
+		/*
+		 * S196: a fresh association round starts here -- the first AUTH after a scan may
+		 * spend its one BSS change.  AUTH->AUTH retries (the ladder) keep the flag.
+		 */
+		if (ostate == IEEE80211_S_SCAN)
+			ic->ic_mgt_bss_change = 0;
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
 		if (ic->ic_flags & IEEE80211_F_RSNON)
 			ieee80211_crypto_clear_groupkeys(ic);
@@ -1559,6 +1586,7 @@ justcleanup:
 		}
 		break;
 	case IEEE80211_S_RUN:
+		ic->ic_mgt_bss_change = 0;	/* S196: a successful link ends the budget */
 		switch (ostate) {
 		case IEEE80211_S_INIT:
 			if (ic->ic_opmode == IEEE80211_M_MONITOR)
